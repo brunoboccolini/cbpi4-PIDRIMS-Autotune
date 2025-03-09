@@ -515,20 +515,39 @@ class AutoTuner(object):
 		try:
 			now = self._getTimeMs()
 
-			# Log do valor de entrada e estado atual
-			logging.info(f"AutoTuner.run - Input: {inputValue}, Estado: {self._state}, Timestamp: {now}")
+			# Log detalhado do início da execução
+			self.log(f'AutoTune.run - Início da execução:')
+			self.log(f'- Valor de entrada: {inputValue}')
+			self.log(f'- Estado atual: {self._state}')
+			self.log(f'- Timestamp: {now}')
+			self.log(f'- Último timestamp: {self._lastRunTimestamp}')
+			self.log(f'- Diferença de tempo: {now - self._lastRunTimestamp}ms')
+			self.log(f'- Setpoint configurado: {self._setpoint}')
+
+			# Verifica se o setpoint é válido
+			if self._setpoint is None or self._setpoint <= 0:
+				self.log(f'Erro: Setpoint inválido ({self._setpoint})')
+				self._state = AutoTuner.STATE_FAILED
+				return True
 
 			# Verifica se o valor de entrada é válido
 			if inputValue is None:
-				logging.error("Valor de entrada inválido (None)")
+				self.log('Erro: Valor de entrada é None')
 				self._state = AutoTuner.STATE_FAILED
 				return True
 
 			# Converte para float se necessário
 			try:
 				inputValue = float(inputValue)
+				self.log(f'Valor de entrada convertido para float: {inputValue}')
 			except (TypeError, ValueError) as e:
-				logging.error(f"Erro ao converter valor de entrada: {str(e)}")
+				self.log(f'Erro ao converter valor de entrada: {str(e)}')
+				self._state = AutoTuner.STATE_FAILED
+				return True
+
+			# Verifica se o valor de entrada está dentro de uma faixa razoável
+			if inputValue > (self._setpoint * 2) or inputValue < 0:
+				self.log(f'Erro: Valor de entrada ({inputValue}) está fora da faixa aceitável (0 - {self._setpoint * 2})')
 				self._state = AutoTuner.STATE_FAILED
 				return True
 
@@ -537,10 +556,11 @@ class AutoTuner(object):
 					or self._state == AutoTuner.STATE_SUCCEEDED
 					or self._state == AutoTuner.STATE_FAILED):
 				try:
+					self.log('Iniciando novo ciclo de AutoTune')
 					self._initTuner(inputValue, now)
-					logging.info(f"AutoTuner reinicializado - Estado: {self._state}, Input: {inputValue}")
+					self.log(f'AutoTuner reinicializado - Estado: {self._state}')
 				except Exception as e:
-					logging.error(f"Erro ao inicializar tuner: {str(e)}")
+					self.log(f'Erro ao inicializar tuner: {str(e)}')
 					self._state = AutoTuner.STATE_FAILED
 					return True
 
@@ -687,19 +707,38 @@ class AutoTuner(object):
 
 	def _initTuner(self, inputValue, timestamp):
 		try:
-			logging.info(f"Iniciando AutoTuner - Input: {inputValue}, Timestamp: {timestamp}")
+			# Log detalhado dos parâmetros de entrada
+			self.log(f'Iniciando AutoTuner com os seguintes parâmetros:')
+			self.log(f'- Valor de entrada: {inputValue}')
+			self.log(f'- Timestamp: {timestamp}')
+			self.log(f'- Setpoint: {self._setpoint}')
+			self.log(f'- Output Step: {self._outputstep}')
+			self.log(f'- Noise Band: {self._noiseband}')
 			
-			# Validação dos valores de entrada
-			if inputValue is None or timestamp is None:
-				raise ValueError("Input ou timestamp inválidos")
+			# Validação detalhada dos valores de entrada
+			if inputValue is None:
+				self.log('Erro: Valor de entrada é None')
+				raise ValueError("Valor de entrada não pode ser None")
+				
+			if timestamp is None:
+				self.log('Erro: Timestamp é None')
+				raise ValueError("Timestamp não pode ser None")
 			
-			# Converte e valida o valor de entrada
+			# Converte e valida o valor de entrada com mais detalhes
 			try:
 				inputValue = float(inputValue)
-				if inputValue <= 0:
-					raise ValueError("Temperatura de entrada deve ser maior que zero")
+				self.log(f'Valor de entrada convertido para float: {inputValue}')
 			except (TypeError, ValueError) as e:
-				raise ValueError(f"Erro ao converter temperatura de entrada: {str(e)}")
+				self.log(f'Erro ao converter valor de entrada: {str(e)}')
+				raise ValueError(f"Erro ao converter valor de entrada para float: {str(e)}")
+				
+			if inputValue <= 0:
+				self.log(f'Erro: Valor de entrada ({inputValue}) deve ser maior que zero')
+				raise ValueError(f"Valor de entrada ({inputValue}) deve ser maior que zero")
+				
+			# Validação do setpoint
+			if abs(inputValue - self._setpoint) > 50:
+				self.log(f'Aviso: Grande diferença entre valor atual ({inputValue}) e setpoint ({self._setpoint})')
 			
 			# Reinicia todas as variáveis
 			self._peakType = 0
@@ -708,35 +747,30 @@ class AutoTuner(object):
 			self._output = self._initialOutput
 			self._Ku = 0
 			self._Pu = 0
-			self._lastRunTimestamp = timestamp  # Importante: inicializa o timestamp
+			self._lastRunTimestamp = timestamp
 			
 			# Limpa os buffers
 			self._inputs.clear()
 			self._peaks.clear()
 			self._peakTimestamps.clear()
 			
-			# Adiciona o primeiro timestamp
+			# Adiciona o primeiro valor e timestamp
+			self._inputs.append(inputValue)
 			self._peakTimestamps.append(timestamp)
 			
 			# Define o estado inicial
 			self._state = AutoTuner.STATE_RELAY_STEP_UP
 			
-			# Adiciona o primeiro valor de entrada
-			self._inputs.append(inputValue)
-			
-			# Log dos valores iniciais
-			logging.info(f"AutoTuner inicializado:")
-			logging.info(f"- Estado: {self._state}")
-			logging.info(f"- Potência inicial: {self._initialOutput}%")
-			logging.info(f"- Temperatura inicial: {inputValue}")
-			logging.info(f"- Setpoint: {self._setpoint}")
-			logging.info(f"- Output Step: {self._outputstep}")
-			logging.info(f"- Noise Band: {self._noiseband}")
+			# Log do estado inicial
+			self.log('AutoTuner inicializado com sucesso:')
+			self.log(f'- Estado: {self._state}')
+			self.log(f'- Potência inicial: {self._initialOutput}%')
+			self.log(f'- Primeiro valor registrado: {inputValue}')
 			
 			return True
 			
 		except Exception as e:
-			logging.error(f"Erro ao inicializar AutoTuner: {str(e)}")
+			self.log(f'Erro fatal na inicialização do AutoTuner: {str(e)}')
 			self._state = AutoTuner.STATE_FAILED
 			raise ValueError(f"Falha na inicialização do AutoTuner: {str(e)}")
 
