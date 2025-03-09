@@ -167,8 +167,29 @@ class PIDRIMSAutotune(CBPiKettleLogic):
             self.heater = self.kettle.heater
             self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
             fixedtarget = 67 if self.TEMP_UNIT == "C" else 153  # Default target if none is set
-            setpoint = float(self.get_kettle_target_temp(self.id))  # Convertido para float
-            current_value = float(self.get_sensor_value(self.kettle.sensor).get("value"))  # Convertido para float
+            
+            # Obter e validar setpoint
+            try:
+                setpoint = float(self.get_kettle_target_temp(self.id))
+                if setpoint <= 0:
+                    setpoint = float(fixedtarget)
+                logging.info(f"Setpoint definido: {setpoint}°{self.TEMP_UNIT}")
+            except Exception as e:
+                logging.error(f"Erro ao obter setpoint: {str(e)}")
+                setpoint = float(fixedtarget)
+                logging.info(f"Usando setpoint padrão: {setpoint}°{self.TEMP_UNIT}")
+
+            # Obter e validar temperatura atual
+            try:
+                current_value = float(self.get_sensor_value(self.kettle.sensor).get("value", 0))
+                if current_value <= 0:
+                    raise ValueError("Temperatura atual inválida")
+                logging.info(f"Temperatura atual: {current_value}°{self.TEMP_UNIT}")
+            except Exception as e:
+                logging.error(f"Erro ao ler temperatura atual: {str(e)}")
+                self.cbpi.notify('PIDRIMS AutoTune', 'Erro ao ler temperatura atual. Verifique o sensor.', NotificationType.ERROR)
+                await self.stop()
+                return
 
             # Log initial values for debugging
             logging.info(f"Iniciando AutoTune com os seguintes valores:")
@@ -201,7 +222,7 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                     await self.stop()
                     return
                 self.cbpi.notify('PIDRIMS AutoTune', f'Temperatura alvo não definida. Sistema usará {fixedtarget}°{self.TEMP_UNIT} como alvo', NotificationType.WARNING)
-                setpoint = float(fixedtarget)  # Convertido para float
+                setpoint = float(fixedtarget)
                 await self.set_target_temp(self.id, setpoint)
         
             if setpoint < current_value:
@@ -211,21 +232,29 @@ class PIDRIMSAutotune(CBPiKettleLogic):
 
             self.cbpi.notify('PIDRIMS AutoTune', 'AutoTune em Progresso. Não desligue o modo Auto até o AutoTune terminar', NotificationType.INFO)
             
-            # Initialize AutoTune parameters
-            outstep = float(self.props.get("Output_Step", 100))
-            outmax = float(self.props.get("Max_Output", 100))
-            lookbackSec = float(self.props.get("lookback_seconds", 30))
-            
-            # Validate parameters
-            if outstep <= 0 or outmax <= 0 or lookbackSec <= 0:
-                raise ValueError(f"Parâmetros inválidos: Output Step={outstep}, Max Output={outmax}, Lookback Seconds={lookbackSec}")
+            # Initialize AutoTune parameters with valores seguros
+            try:
+                outstep = float(self.props.get("Output_Step", 100))
+                outmax = float(self.props.get("Max_Output", 100))
+                lookbackSec = float(self.props.get("lookback_seconds", 30))
+                
+                # Garante valores mínimos seguros
+                outstep = max(20, min(outstep, outmax))  # Entre 20% e outmax
+                lookbackSec = max(10, lookbackSec)  # Mínimo 10 segundos
+                noiseband = 0.5  # Banda de ruído fixa para início
+                
+                logging.info(f"Parâmetros de controle:")
+                logging.info(f"Output Step: {outstep}%")
+                logging.info(f"Max Output: {outmax}%")
+                logging.info(f"Lookback: {lookbackSec}s")
+                logging.info(f"Noise Band: {noiseband}°{self.TEMP_UNIT}")
+            except Exception as e:
+                logging.error(f"Erro ao configurar parâmetros: {str(e)}")
+                self.cbpi.notify('PIDRIMS AutoTune', f'Erro ao configurar parâmetros: {str(e)}', NotificationType.ERROR)
+                await self.stop()
+                return
 
-            # Garante valores mínimos seguros
-            outstep = max(20, min(outstep, outmax))  # Entre 20% e outmax
-            lookbackSec = max(10, lookbackSec)  # Mínimo 10 segundos
-            noiseband = 0.5  # Banda de ruído fixa para início
-
-            heat_percent_old = 0
+            heat_percent_old = 50  # Começa com 50% de potência
             high_temp_diff_time = 0
             last_temp_check = time()
 
@@ -242,6 +271,11 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                 )
                 logging.info("AutoTuner inicializado com sucesso")
                 logging.info(f"Parâmetros - Setpoint: {setpoint}, Output Step: {outstep}, Sample Time: {self.sample_time}, Lookback: {lookbackSec}, Noise Band: {noiseband}")
+                
+                # Liga o aquecedor com potência inicial
+                await self.actor_set_power(self.heater, heat_percent_old)
+                logging.info(f"Aquecedor ligado com {heat_percent_old}% de potência")
+                
             except Exception as e:
                 logging.error(f"Erro ao inicializar AutoTuner: {str(e)}")
                 self.cbpi.notify('PIDRIMS AutoTune', f'Erro ao inicializar AutoTune: {str(e)}', NotificationType.ERROR)
@@ -655,6 +689,18 @@ class AutoTuner(object):
 		try:
 			logging.info(f"Iniciando AutoTuner - Input: {inputValue}, Timestamp: {timestamp}")
 			
+			# Validação dos valores de entrada
+			if inputValue is None or timestamp is None:
+				raise ValueError("Input ou timestamp inválidos")
+			
+			# Converte e valida o valor de entrada
+			try:
+				inputValue = float(inputValue)
+				if inputValue <= 0:
+					raise ValueError("Temperatura de entrada deve ser maior que zero")
+			except (TypeError, ValueError) as e:
+				raise ValueError(f"Erro ao converter temperatura de entrada: {str(e)}")
+			
 			# Reinicia todas as variáveis
 			self._peakType = 0
 			self._peakCount = 0
@@ -662,6 +708,7 @@ class AutoTuner(object):
 			self._output = self._initialOutput
 			self._Ku = 0
 			self._Pu = 0
+			self._lastRunTimestamp = timestamp  # Importante: inicializa o timestamp
 			
 			# Limpa os buffers
 			self._inputs.clear()
@@ -675,15 +722,23 @@ class AutoTuner(object):
 			self._state = AutoTuner.STATE_RELAY_STEP_UP
 			
 			# Adiciona o primeiro valor de entrada
-			self._inputs.append(float(inputValue))
+			self._inputs.append(inputValue)
 			
-			logging.info(f"AutoTuner inicializado com sucesso - Estado: {self._state}, Output Inicial: {self._initialOutput}%")
+			# Log dos valores iniciais
+			logging.info(f"AutoTuner inicializado:")
+			logging.info(f"- Estado: {self._state}")
+			logging.info(f"- Potência inicial: {self._initialOutput}%")
+			logging.info(f"- Temperatura inicial: {inputValue}")
+			logging.info(f"- Setpoint: {self._setpoint}")
+			logging.info(f"- Output Step: {self._outputstep}")
+			logging.info(f"- Noise Band: {self._noiseband}")
+			
 			return True
 			
 		except Exception as e:
 			logging.error(f"Erro ao inicializar AutoTuner: {str(e)}")
 			self._state = AutoTuner.STATE_FAILED
-			raise
+			raise ValueError(f"Falha na inicialização do AutoTuner: {str(e)}")
 
 def setup(cbpi):
     '''
