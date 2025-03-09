@@ -92,9 +92,24 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                 self.kettle.instance.state = False
                 await self.cbpi.kettle.update(self.id)
                 
-            # Notifica o usuário
+            # Notifica o usuário e registra no log
             if not self.finished:
                 self.cbpi.notify('PIDRIMS AutoTune', 'Processo interrompido manualmente.', NotificationType.INFO)
+                logging.info("AutoTune interrompido manualmente pelo usuário")
+                try:
+                    # Garante que o diretório de logs existe
+                    import os
+                    log_dir = "./logs"
+                    if not os.path.exists(log_dir):
+                        os.makedirs(log_dir)
+
+                    # Adiciona entrada no arquivo de log
+                    filename = os.path.join(log_dir, "autotune.log")
+                    formatted_time = strftime("%Y-%m-%d %H:%M:%S", localtime())
+                    with open(filename, "a", encoding='utf-8') as file:
+                        file.write("%s,AutoTune interrompido manualmente pelo usuário\n" % formatted_time)
+                except Exception as e:
+                    logging.error(f"Erro ao escrever no log de interrupção manual: {str(e)}")
 
         except Exception as e:
             logging.error(f"Erro no on_stop: {str(e)}")
@@ -173,11 +188,18 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                 setpoint = float(self.get_kettle_target_temp(self.id))
                 if setpoint <= 0:
                     setpoint = float(fixedtarget)
+                    # Atualiza o setpoint no dashboard
+                    await self.set_target_temp(self.id, setpoint)
                 logging.info(f"Setpoint definido: {setpoint}°{self.TEMP_UNIT}")
             except Exception as e:
                 logging.error(f"Erro ao obter setpoint: {str(e)}")
                 setpoint = float(fixedtarget)
+                # Atualiza o setpoint no dashboard
+                await self.set_target_temp(self.id, setpoint)
                 logging.info(f"Usando setpoint padrão: {setpoint}°{self.TEMP_UNIT}")
+
+            # Força atualização do setpoint no dashboard
+            await self.cbpi.kettle.update(self.id)
 
             # Obter e validar temperatura atual
             try:
@@ -778,11 +800,11 @@ class AutoTuner(object):
 			# Validação detalhada dos valores de entrada
 			if inputValue is None:
 				self.log('Erro: Valor de entrada é None')
-				raise ValueError("Valor de entrada não pode ser None")
+				return False
 				
 			if timestamp is None:
 				self.log('Erro: Timestamp é None')
-				raise ValueError("Timestamp não pode ser None")
+				return False
 			
 			# Converte e valida o valor de entrada com mais detalhes
 			try:
@@ -790,11 +812,11 @@ class AutoTuner(object):
 				self.log(f'Valor de entrada convertido para float: {inputValue}')
 			except (TypeError, ValueError) as e:
 				self.log(f'Erro ao converter valor de entrada: {str(e)}')
-				raise ValueError(f"Erro ao converter valor de entrada para float: {str(e)}")
+				return False
 				
 			if inputValue <= 0:
 				self.log(f'Erro: Valor de entrada ({inputValue}) deve ser maior que zero')
-				raise ValueError(f"Valor de entrada ({inputValue}) deve ser maior que zero")
+				return False
 				
 			# Validação do setpoint
 			if abs(inputValue - self._setpoint) > 50:
@@ -830,9 +852,8 @@ class AutoTuner(object):
 			return True
 			
 		except Exception as e:
-			self.log(f'Erro fatal na inicialização do AutoTuner: {str(e)}')
-			self._state = AutoTuner.STATE_FAILED
-			raise ValueError(f"Falha na inicialização do AutoTuner: {str(e)}")
+			self.log(f'Erro na inicialização do AutoTuner: {str(e)}')
+			return False
 
 def setup(cbpi):
     '''
