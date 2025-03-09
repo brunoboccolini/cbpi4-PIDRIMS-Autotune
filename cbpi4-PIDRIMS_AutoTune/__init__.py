@@ -181,9 +181,40 @@ class PIDRIMSAutotune(CBPiKettleLogic):
 
             # Obter e validar temperatura atual
             try:
-                current_value = float(self.get_sensor_value(self.kettle.sensor).get("value", 0))
+                sensor_value = self.get_sensor_value(self.kettle.sensor)
+                if sensor_value is None:
+                    logging.error("Erro: Sensor não retornou valor")
+                    self.cbpi.notify('PIDRIMS AutoTune', 'Erro ao ler sensor. Verifique a conexão.', NotificationType.ERROR)
+                    await self.stop()
+                    return
+
+                current_value = sensor_value.get("value", None)
+                if current_value is None:
+                    logging.error("Erro: Valor do sensor é None")
+                    self.cbpi.notify('PIDRIMS AutoTune', 'Erro ao ler valor do sensor.', NotificationType.ERROR)
+                    await self.stop()
+                    return
+
+                try:
+                    current_value = float(current_value)
+                except (TypeError, ValueError) as e:
+                    logging.error(f"Erro ao converter valor do sensor para float: {str(e)}")
+                    self.cbpi.notify('PIDRIMS AutoTune', 'Valor do sensor inválido.', NotificationType.ERROR)
+                    await self.stop()
+                    return
+
                 if current_value <= 0:
-                    raise ValueError("Temperatura atual inválida")
+                    logging.error(f"Erro: Temperatura atual inválida: {current_value}")
+                    self.cbpi.notify('PIDRIMS AutoTune', 'Temperatura atual inválida. Verifique o sensor.', NotificationType.ERROR)
+                    await self.stop()
+                    return
+
+                if math.isnan(current_value) or math.isinf(current_value):
+                    logging.error(f"Erro: Temperatura atual não é um número válido: {current_value}")
+                    self.cbpi.notify('PIDRIMS AutoTune', 'Temperatura atual inválida (NaN/Inf).', NotificationType.ERROR)
+                    await self.stop()
+                    return
+
                 logging.info(f"Temperatura atual: {current_value}°{self.TEMP_UNIT}")
             except Exception as e:
                 logging.error(f"Erro ao ler temperatura atual: {str(e)}")
@@ -267,7 +298,8 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                     lookbackSec=lookbackSec,
                     outputMin=0,
                     outputMax=outmax,
-                    noiseband=noiseband
+                    noiseband=noiseband,
+                    getTimeMs=lambda: time() * 1000  # Fornece uma função de tempo confiável
                 )
                 logging.info("AutoTuner inicializado com sucesso")
                 logging.info(f"Parâmetros - Setpoint: {setpoint}, Output Step: {outstep}, Sample Time: {self.sample_time}, Lookback: {lookbackSec}, Noise Band: {noiseband}")
@@ -505,205 +537,233 @@ class AutoTuner(object):
 		return AutoTuner.PIDParams(kp, ki, kd)
 
 	def log(self, text):
-		filename = "./logs/autotune.log"
-		formatted_time = strftime("%Y-%m-%d %H:%M:%S", localtime())
+		try:
+			# Garante que o diretório de logs existe
+			import os
+			log_dir = "./logs"
+			if not os.path.exists(log_dir):
+				os.makedirs(log_dir)
 
-		with open(filename, "a") as file:
-			file.write("%s,%s\n" % (formatted_time, text))
-		
+			filename = os.path.join(log_dir, "autotune.log")
+			formatted_time = strftime("%Y-%m-%d %H:%M:%S", localtime())
+
+			# Também usa o logging padrão
+			logging.info(f"AutoTune: {text}")
+
+			# Escreve no arquivo de log
+			with open(filename, "a", encoding='utf-8') as file:
+				file.write("%s,%s\n" % (formatted_time, text))
+		except Exception as e:
+			logging.error(f"Erro ao escrever no log: {str(e)}")
+			# Não propaga o erro para não interromper o processo
+
 	def run(self, inputValue):
 		try:
-			now = self._getTimeMs()
-
-			# Log detalhado do início da execução
-			self.log(f'AutoTune.run - Início da execução:')
-			self.log(f'- Valor de entrada: {inputValue}')
-			self.log(f'- Estado atual: {self._state}')
-			self.log(f'- Timestamp: {now}')
-			self.log(f'- Último timestamp: {self._lastRunTimestamp}')
-			self.log(f'- Diferença de tempo: {now - self._lastRunTimestamp}ms')
-			self.log(f'- Setpoint configurado: {self._setpoint}')
-
-			# Verifica se o setpoint é válido
-			if self._setpoint is None or self._setpoint <= 0:
-				self.log(f'Erro: Setpoint inválido ({self._setpoint})')
-				self._state = AutoTuner.STATE_FAILED
-				return True
-
-			# Verifica se o valor de entrada é válido
+			# Verifica se o valor de entrada é válido antes de qualquer processamento
 			if inputValue is None:
-				self.log('Erro: Valor de entrada é None')
+				self.log('Erro crítico: inputValue é None')
 				self._state = AutoTuner.STATE_FAILED
 				return True
 
-			# Converte para float se necessário
+			# Tenta converter o valor de entrada para float
 			try:
 				inputValue = float(inputValue)
-				self.log(f'Valor de entrada convertido para float: {inputValue}')
+				self.log(f'Valor de entrada convertido: {inputValue}')
 			except (TypeError, ValueError) as e:
-				self.log(f'Erro ao converter valor de entrada: {str(e)}')
+				self.log(f'Erro crítico: Não foi possível converter inputValue para float: {str(e)}')
 				self._state = AutoTuner.STATE_FAILED
 				return True
 
-			# Verifica se o valor de entrada está dentro de uma faixa razoável
-			if inputValue > (self._setpoint * 2) or inputValue < 0:
-				self.log(f'Erro: Valor de entrada ({inputValue}) está fora da faixa aceitável (0 - {self._setpoint * 2})')
+			# Verifica se o valor de entrada é um número válido
+			if math.isnan(inputValue) or math.isinf(inputValue):
+				self.log(f'Erro crítico: inputValue não é um número válido: {inputValue}')
 				self._state = AutoTuner.STATE_FAILED
 				return True
 
-			# Inicializa o tuner se necessário
+			# Obtém o timestamp atual
+			try:
+				now = self._getTimeMs()
+				self.log(f'Timestamp atual: {now}')
+			except Exception as e:
+				self.log(f'Erro crítico ao obter timestamp: {str(e)}')
+				self._state = AutoTuner.STATE_FAILED
+				return True
+
+			# Verifica se o timestamp é válido
+			if now <= 0:
+				self.log(f'Erro crítico: timestamp inválido: {now}')
+				self._state = AutoTuner.STATE_FAILED
+				return True
+
+			# Log do estado atual
+			self.log(f'Estado atual do AutoTune:')
+			self.log(f'- Estado: {self._state}')
+			self.log(f'- Setpoint: {self._setpoint}')
+			self.log(f'- Valor atual: {inputValue}')
+			self.log(f'- Último timestamp: {self._lastRunTimestamp}')
+			self.log(f'- Diferença de tempo: {now - self._lastRunTimestamp}ms')
+
+			# Verifica se precisa inicializar o tuner
 			if (self._state == AutoTuner.STATE_OFF
 					or self._state == AutoTuner.STATE_SUCCEEDED
 					or self._state == AutoTuner.STATE_FAILED):
 				try:
 					self.log('Iniciando novo ciclo de AutoTune')
-					self._initTuner(inputValue, now)
-					self.log(f'AutoTuner reinicializado - Estado: {self._state}')
+					success = self._initTuner(inputValue, now)
+					if not success:
+						self.log('Falha na inicialização do AutoTune')
+						self._state = AutoTuner.STATE_FAILED
+						return True
+					self.log(f'AutoTune inicializado com sucesso. Novo estado: {self._state}')
 				except Exception as e:
-					self.log(f'Erro ao inicializar tuner: {str(e)}')
+					self.log(f'Erro crítico na inicialização do AutoTune: {str(e)}')
 					self._state = AutoTuner.STATE_FAILED
 					return True
 
 			# Verifica se já passou tempo suficiente desde a última execução
 			if (now - self._lastRunTimestamp) < self._sampleTime:
-				logging.debug(f"Aguardando tempo de amostragem - Decorrido: {now - self._lastRunTimestamp}ms")
+				self.log(f'Aguardando tempo de amostragem. Decorrido: {now - self._lastRunTimestamp}ms de {self._sampleTime}ms')
 				return False
 
 			self._lastRunTimestamp = now
 
-			# Log dos valores atuais
-			logging.info(f"Estado atual - Input: {inputValue}, Setpoint: {self._setpoint}, Noise Band: {self._noiseband}")
-			
-			# check input and change relay state if necessary
+			# Verifica e atualiza o estado do relé
 			if (self._state == AutoTuner.STATE_RELAY_STEP_UP
 					and inputValue > self._setpoint + self._noiseband):
 				self._state = AutoTuner.STATE_RELAY_STEP_DOWN
-				logging.info(f"Mudando para STEP_DOWN - Input: {inputValue} > Setpoint+Noise: {self._setpoint + self._noiseband}")
-				self.log(f'Mudando estado para: {self._state}')
-				self.log(f'Input: {inputValue}')
+				self.log(f'Mudando para STEP_DOWN - Input ({inputValue}) > Setpoint+Noise ({self._setpoint + self._noiseband})')
 			elif (self._state == AutoTuner.STATE_RELAY_STEP_DOWN
 					and inputValue < self._setpoint - self._noiseband):
 				self._state = AutoTuner.STATE_RELAY_STEP_UP
-				logging.info(f"Mudando para STEP_UP - Input: {inputValue} < Setpoint-Noise: {self._setpoint - self._noiseband}")
-				self.log(f'Mudando estado para: {self._state}')
-				self.log(f'Input: {inputValue}')
+				self.log(f'Mudando para STEP_UP - Input ({inputValue}) < Setpoint-Noise ({self._setpoint - self._noiseband})')
 
-			# set output
+			# Atualiza a saída baseado no estado
 			old_output = self._output
-			if (self._state == AutoTuner.STATE_RELAY_STEP_UP):
+			if self._state == AutoTuner.STATE_RELAY_STEP_UP:
 				self._output = self._initialOutput + self._outputstep
 			elif self._state == AutoTuner.STATE_RELAY_STEP_DOWN:
 				self._output = self._initialOutput - self._outputstep
 			else:
-				# Se o estado não é STEP_UP nem STEP_DOWN, mantém o output inicial
 				self._output = self._initialOutput
 
-			# respect output limits
+			# Respeita os limites de saída
 			self._output = min(self._output, self._outputMax)
 			self._output = max(self._output, self._outputMin)
 
 			if old_output != self._output:
-				logging.info(f"Saída atualizada: {self._output}% (anterior: {old_output}%)")
+				self.log(f'Saída atualizada: {self._output}% (anterior: {old_output}%)')
 
-			# identify peaks
-			isMax = True
-			isMin = True
-
-			for val in self._inputs:
-				isMax = isMax and (inputValue > val)
-				isMin = isMin and (inputValue < val)
-
-			self._inputs.append(inputValue)
-
-			# Log do estado do buffer de entradas
-			logging.debug(f"Buffer de entradas: {len(self._inputs)}/{self._inputs.maxlen}")
-
-			# we don't want to trust the maxes or mins until the input array is full
-			if len(self._inputs) < self._inputs.maxlen:
-				logging.info(f"Aguardando buffer encher: {len(self._inputs)}/{self._inputs.maxlen}")
-				return False
-
-			# increment peak count and record peak time for maxima and minima
-			inflection = False
-
-			# peak types:
-			# -1: minimum
-			# +1: maximum
-			if isMax:
-				if self._peakType == -1:
-					inflection = True
-				self._peakType = 1
-			elif isMin:
-				if self._peakType == 1:
-					inflection = True
-				self._peakType = -1
-
-			# update peak times and values
-			if inflection:
-				self._peakCount += 1
-				self._peaks.append(inputValue)
-				self._peakTimestamps.append(now)
-				logging.info(f"Pico encontrado: {inputValue} (total: {self._peakCount})")
-				self.log(f'Pico encontrado: {inputValue}')
-				self.log(f'Total de picos: {self._peakCount}')
-
-			# check for convergence of induced oscillation
-			# convergence of amplitude assessed on last 4 peaks (1.5 cycles)
-			self._inducedAmplitude = 0
-
-			if inflection and (self._peakCount > 4):
-				absMax = self._peaks[-2]
-				absMin = self._peaks[-2]
-				for i in range(0, len(self._peaks) - 2):
-					self._inducedAmplitude += abs(self._peaks[i] - self._peaks[i+1])
-					absMax = max(self._peaks[i], absMax)
-					absMin = min(self._peaks[i], absMin)
-
-				self._inducedAmplitude /= 6.0
-
-				# check convergence criterion for amplitude of induced oscillation
-				amplitudeDev = ((0.5 * (absMax - absMin) - self._inducedAmplitude)
-								/ self._inducedAmplitude)
-
-				logging.info(f"Amplitude: {self._inducedAmplitude}, Desvio: {amplitudeDev}")
-				self.log(f'Amplitude: {self._inducedAmplitude}')
-				self.log(f'Desvio de amplitude: {amplitudeDev}')
-
-				if amplitudeDev < AutoTuner.PEAK_AMPLITUDE_TOLERANCE:
-					self._state = AutoTuner.STATE_SUCCEEDED
-					logging.info("AutoTune convergiu com sucesso!")
-
-			# if the autotune has not already converged
-			# terminate after 10 cycles
-			if self._peakCount >= 20:
-				logging.error("AutoTune falhou - Número máximo de picos atingido sem convergência")
-				self._output = 0
+			# Processa os picos
+			try:
+				self._processInputValue(inputValue, now)
+			except Exception as e:
+				self.log(f'Erro ao processar valor de entrada: {str(e)}')
 				self._state = AutoTuner.STATE_FAILED
-				return True
-
-			if self._state == AutoTuner.STATE_SUCCEEDED:
-				self._output = 0
-
-				# calculate ultimate gain
-				self._Ku = 4.0 * self._outputstep / (self._inducedAmplitude * math.pi)
-
-				# calculate ultimate period in seconds
-				period1 = self._peakTimestamps[3] - self._peakTimestamps[1]
-				period2 = self._peakTimestamps[4] - self._peakTimestamps[2]
-				self._Pu = 0.5 * (period1 + period2) / 1000.0
-				
-				logging.info(f"Parâmetros finais - Ku: {self._Ku}, Pu: {self._Pu}")
 				return True
 
 			return False
 
 		except Exception as e:
-			logging.error(f"Erro no método run: {str(e)}")
+			self.log(f'Erro crítico no método run: {str(e)}')
 			self._state = AutoTuner.STATE_FAILED
 			return True
 
+	def _processInputValue(self, inputValue, now):
+		# Identifica picos
+		isMax = True
+		isMin = True
+
+		for val in self._inputs:
+			isMax = isMax and (inputValue > val)
+			isMin = isMin and (inputValue < val)
+
+		self._inputs.append(inputValue)
+		self.log(f'Buffer de entradas: {len(self._inputs)}/{self._inputs.maxlen}')
+
+		if len(self._inputs) < self._inputs.maxlen:
+			self.log(f'Aguardando buffer encher: {len(self._inputs)}/{self._inputs.maxlen}')
+			return
+
+		# Processa picos
+		inflection = False
+		if isMax:
+			if self._peakType == -1:
+				inflection = True
+			self._peakType = 1
+		elif isMin:
+			if self._peakType == 1:
+				inflection = True
+			self._peakType = -1
+
+		if inflection:
+			self._peakCount += 1
+			self._peaks.append(inputValue)
+			self._peakTimestamps.append(now)
+			self.log(f'Pico encontrado: {inputValue} (total: {self._peakCount})')
+
+			if self._peakCount > 4:
+				self._checkConvergence()
+
+		# Verifica número máximo de picos
+		if self._peakCount >= 20:
+			self.log('Número máximo de picos atingido sem convergência')
+			self._output = 0
+			self._state = AutoTuner.STATE_FAILED
+
+	def _checkConvergence(self):
+		try:
+			self._inducedAmplitude = 0
+			absMax = self._peaks[-2]
+			absMin = self._peaks[-2]
+
+			for i in range(0, len(self._peaks) - 2):
+				self._inducedAmplitude += abs(self._peaks[i] - self._peaks[i+1])
+				absMax = max(self._peaks[i], absMax)
+				absMin = min(self._peaks[i], absMin)
+
+			self._inducedAmplitude /= 6.0
+
+			amplitudeDev = ((0.5 * (absMax - absMin) - self._inducedAmplitude)
+							/ self._inducedAmplitude)
+
+			self.log(f'Verificando convergência:')
+			self.log(f'- Amplitude induzida: {self._inducedAmplitude}')
+			self.log(f'- Desvio de amplitude: {amplitudeDev}')
+
+			if amplitudeDev < AutoTuner.PEAK_AMPLITUDE_TOLERANCE:
+				self._state = AutoTuner.STATE_SUCCEEDED
+				self.log('AutoTune convergiu com sucesso!')
+				self._calculateFinalParameters()
+
+		except Exception as e:
+			self.log(f'Erro ao verificar convergência: {str(e)}')
+			raise
+
+	def _calculateFinalParameters(self):
+		try:
+			self._output = 0
+			self._Ku = 4.0 * self._outputstep / (self._inducedAmplitude * math.pi)
+			period1 = self._peakTimestamps[3] - self._peakTimestamps[1]
+			period2 = self._peakTimestamps[4] - self._peakTimestamps[2]
+			self._Pu = 0.5 * (period1 + period2) / 1000.0
+			
+			self.log(f'Parâmetros finais calculados:')
+			self.log(f'- Ku: {self._Ku}')
+			self.log(f'- Pu: {self._Pu}')
+		except Exception as e:
+			self.log(f'Erro ao calcular parâmetros finais: {str(e)}')
+			raise
+
 	def _currentTimeMs(self):
-		return time.time() * 1000
+		try:
+			current_time = time() * 1000
+			if current_time <= 0:
+				self.log(f'Erro: Timestamp inválido ({current_time})')
+				raise ValueError(f"Timestamp inválido: {current_time}")
+			return current_time
+		except Exception as e:
+			self.log(f'Erro ao obter timestamp atual: {str(e)}')
+			raise ValueError(f"Erro ao obter timestamp: {str(e)}")
 
 	def _initTuner(self, inputValue, timestamp):
 		try:
