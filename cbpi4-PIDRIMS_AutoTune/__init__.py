@@ -170,6 +170,14 @@ class PIDRIMSAutotune(CBPiKettleLogic):
             setpoint = int(self.get_kettle_target_temp(self.id))
             current_value = self.get_sensor_value(self.kettle.sensor).get("value")
 
+            # Log initial values for debugging
+            logging.info(f"Iniciando AutoTune com os seguintes valores:")
+            logging.info(f"Setpoint: {setpoint}°{self.TEMP_UNIT}")
+            logging.info(f"Temperatura atual: {current_value}°{self.TEMP_UNIT}")
+            logging.info(f"Output Step: {float(self.props.get('Output_Step', 100))}")
+            logging.info(f"Sample Time: {self.sample_time}")
+            logging.info(f"Lookback Seconds: {float(self.props.get('lookback_seconds', 30))}")
+
             # Verify RIMS sensor configuration
             if not self.rims_sensor:
                 self.cbpi.notify('PIDRIMS AutoTune', 'Sensor RIMS não configurado!', NotificationType.ERROR)
@@ -186,45 +194,55 @@ class PIDRIMSAutotune(CBPiKettleLogic):
             if not await self.check_pump_status():
                 return
 
-            # Log initial configuration
-            logging.info("AutoTune iniciando com: Setpoint={}°{}, RIMS Sensor={}, Pump={}, Max Temp Diff={}°{}".format(
-                setpoint, self.TEMP_UNIT, self.rims_sensor, self.pump, self.max_temp_diff, self.TEMP_UNIT))
-
             # Initial safety checks and target temperature validation
             if setpoint == 0:
                 if fixedtarget < current_value:
-                    self.cbpi.notify('PIDRIMS AutoTune', 'No target temperature defined and current temperature is above fallback value of {} °{}. Please set target temperature above current or wait until system cools down.'.format(fixedtarget,self.TEMP_UNIT), NotificationType.ERROR)
+                    self.cbpi.notify('PIDRIMS AutoTune', f'Temperatura alvo não definida e temperatura atual está acima do valor padrão de {fixedtarget}°{self.TEMP_UNIT}. Por favor, defina uma temperatura alvo acima da atual ou aguarde o sistema esfriar.', NotificationType.ERROR)
                     await self.stop()
                     return
-                self.cbpi.notify('PIDRIMS AutoTune', 'No target temperature defined. System will set target to {} °{} and start AutoTune'.format(fixedtarget,self.TEMP_UNIT), NotificationType.WARNING)
+                self.cbpi.notify('PIDRIMS AutoTune', f'Temperatura alvo não definida. Sistema usará {fixedtarget}°{self.TEMP_UNIT} como alvo', NotificationType.WARNING)
                 setpoint = fixedtarget
                 await self.set_target_temp(self.id,setpoint)
         
             if setpoint < current_value:
-                self.cbpi.notify('PIDRIMS AutoTune', 'Target temperature is below current temperature. Choose a higher setpoint or wait until temperature is below target and restart AutoTune', NotificationType.ERROR)
+                self.cbpi.notify('PIDRIMS AutoTune', 'Temperatura alvo está abaixo da temperatura atual. Escolha um setpoint mais alto ou aguarde a temperatura baixar e reinicie o AutoTune', NotificationType.ERROR)
                 await self.stop()
                 return
 
-            self.cbpi.notify('PIDRIMS AutoTune', 'AutoTune in Progress. Do not turn off Auto mode until AutoTune is complete', NotificationType.INFO)
+            self.cbpi.notify('PIDRIMS AutoTune', 'AutoTune em Progresso. Não desligue o modo Auto até o AutoTune terminar', NotificationType.INFO)
             
             # Initialize AutoTune parameters
             outstep = float(self.props.get("Output_Step", 100))
             outmax = float(self.props.get("Max_Output", 100))
             lookbackSec = float(self.props.get("lookback_seconds", 30))
+            
+            # Validate parameters
+            if outstep <= 0 or outmax <= 0 or lookbackSec <= 0:
+                raise ValueError(f"Parâmetros inválidos: Output Step={outstep}, Max Output={outmax}, Lookback Seconds={lookbackSec}")
+
             heat_percent_old = 0
-            high_temp_diff_time = 0  # Tracks time spent at high temperatures
+            high_temp_diff_time = 0
             last_temp_check = time()
 
-            # Create and initialize AutoTuner
+            # Create and initialize AutoTuner with more detailed error handling
             try:
-                atune = AutoTuner(setpoint, outstep, self.sample_time, lookbackSec, 0, outmax)
+                atune = AutoTuner(
+                    setpoint=setpoint,
+                    outputstep=outstep,
+                    sampleTimeSec=self.sample_time,
+                    lookbackSec=lookbackSec,
+                    outputMin=0,
+                    outputMax=outmax,
+                    noiseband=0.5
+                )
+                logging.info("AutoTuner inicializado com sucesso")
             except Exception as e:
-                self.cbpi.notify('PIDRIMS AutoTune', 'AutoTune Error: {}'.format(str(e)), NotificationType.ERROR)
-                atune.log(str(e))
-                await self.autoOff()
+                logging.error(f"Erro ao inicializar AutoTuner: {str(e)}")
+                self.cbpi.notify('PIDRIMS AutoTune', f'Erro ao inicializar AutoTune: {str(e)}', NotificationType.ERROR)
+                await self.stop()
                 return
 
-            atune.log("PIDRIMS AutoTune will now begin")
+            atune.log("PIDRIMS AutoTune iniciando")
 
             try:
                 # Main autotuning loop
@@ -247,29 +265,32 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                     temp_diff = rims_temp - setpoint
                     time_elapsed = current_time - last_temp_check
 
-                    # Log temperatures for debugging
-                    logging.info("Temps - RIMS: {}°{}, MLT: {}°{}, Setpoint: {}°{}, Power: {}%".format(
-                        rims_temp, self.TEMP_UNIT, mlt_temp, self.TEMP_UNIT, setpoint, self.TEMP_UNIT, heat_percent))
+                    # Log temperatures and state for debugging
+                    logging.info(f"Estado atual - RIMS: {rims_temp}°{self.TEMP_UNIT}, MLT: {mlt_temp}°{self.TEMP_UNIT}, Setpoint: {setpoint}°{self.TEMP_UNIT}")
+                    logging.info(f"Potência: {heat_percent}%, Estado AutoTune: {atune.state}, Picos detectados: {atune._peakCount}")
                     
                     # Safety cutoff: stop heating if RIMS temperature exceeds limit
                     if rims_temp > (setpoint + self.max_temp_diff):
                         heat_percent = 0
                         high_temp_diff_time += time_elapsed
                         
+                        # Log high temperature event
+                        logging.warning(f"Temperatura RIMS muito alta: {rims_temp}°{self.TEMP_UNIT}, Tempo em alta: {high_temp_diff_time:.1f}s")
+                        
                         # Dynamic adjustment of AutoTune parameters based on thermal behavior
                         if high_temp_diff_time > 30:  # After 30 seconds at high temperature
                             atune._noiseband = min(2.0, atune._noiseband * 1.1)  # Increase noise tolerance
                             atune._outputstep = max(20, atune._outputstep * 0.9)  # Reduce power steps
+                            logging.info(f"Ajustando parâmetros - Noise Band: {atune._noiseband}, Output Step: {atune._outputstep}")
                         
-                        atune.log('RIMS temperature too high ({}°{}). Heating power set to 0%. High time: {:.1f}s'.format(
-                            rims_temp, self.TEMP_UNIT, high_temp_diff_time))
-                        self.cbpi.notify('PIDRIMS AutoTune', 'RIMS temperature too high ({}°{}). Heating disabled.'.format(
-                            rims_temp, self.TEMP_UNIT), NotificationType.WARNING)
+                        atune.log(f'Temperatura RIMS muito alta ({rims_temp}°{self.TEMP_UNIT}). Aquecimento desligado. Tempo em alta: {high_temp_diff_time:.1f}s')
+                        self.cbpi.notify('PIDRIMS AutoTune', f'Temperatura RIMS muito alta ({rims_temp}°{self.TEMP_UNIT}). Aquecimento desligado.', NotificationType.WARNING)
 
                         # Force power update
                         if heat_percent_old != 0:
                             await self.actor_set_power(self.heater, 0)
                             heat_percent_old = 0
+                            logging.info("Aquecedor forçado para 0%")
                     else:
                         # Reset high temperature timer when temperature is normal
                         high_temp_diff_time = max(0, high_temp_diff_time - time_elapsed)
@@ -278,45 +299,53 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                     if heat_percent != heat_percent_old:
                         await self.actor_set_power(self.heater, heat_percent)
                         heat_percent_old = heat_percent
-                        status = "above" if temp_diff > 0 else "below"
-                        atune.log('Power set to: {}%, RIMS {}°{} {} target, High time: {:.1f}s'.format(
-                            heat_percent, abs(temp_diff), self.TEMP_UNIT, status, high_temp_diff_time))
+                        status = "acima" if temp_diff > 0 else "abaixo"
+                        logging.info(f"Potência atualizada: {heat_percent}%, RIMS {abs(temp_diff)}°{self.TEMP_UNIT} {status} do alvo")
+                        atune.log(f'Potência: {heat_percent}%, RIMS {abs(temp_diff)}°{self.TEMP_UNIT} {status} do alvo, Tempo em alta: {high_temp_diff_time:.1f}s')
                     
                     last_temp_check = current_time
                     await asyncio.sleep(self.sample_time)
 
                 # Process AutoTune results
                 if atune.state == atune.STATE_SUCCEEDED:
-                    atune.log("PIDRIMS AutoTune completed successfully")
-                    atune.log("Total time with high temperature: {:.1f}s".format(high_temp_diff_time))
-                    # Calculate PID parameters for each tuning rule
+                    logging.info("AutoTune completado com sucesso!")
+                    atune.log("AutoTune completado com sucesso")
+                    atune.log(f"Tempo total em temperatura alta: {high_temp_diff_time:.1f}s")
+                    
+                    # Calculate and log PID parameters for each tuning rule
                     for rule in atune.tuningRules:
                         params = atune.getPIDParameters(rule)
-                        # Adjust parameters if system showed tendency to overheat
                         if high_temp_diff_time > 60:
                             params = self.adjust_params_for_temp_behavior(params, high_temp_diff_time)
-                        atune.log('rule: {0}'.format(rule))
-                        atune.log('P: {0}'.format(params.Kp))
-                        atune.log('I: {0}'.format(params.Ki))
-                        atune.log('D: {0}'.format(params.Kd))
+                        logging.info(f"Regra: {rule} - P: {params.Kp:.8f}, I: {params.Ki:.8f}, D: {params.Kd:.8f}")
+                        atune.log(f'Regra: {rule}')
+                        atune.log(f'P: {params.Kp}')
+                        atune.log(f'I: {params.Ki}')
+                        atune.log(f'D: {params.Kd}')
+                        
                         # Use RIMS-specific moderate tuning rule
                         if rule == "rims-moderate":
-                            self.cbpi.notify('AutoTune completed successfully',
-                                "P Value: %.8f | I Value: %.8f | D Value: %.8f" % (params.Kp, params.Ki, params.Kd),
+                            self.cbpi.notify('AutoTune completado com sucesso',
+                                f"P: {params.Kp:.8f} | I: {params.Ki:.8f} | D: {params.Kd:.8f}",
                                 action=[NotificationAction("OK")])
                 else:
-                    atune.log("PIDRIMS AutoTune failed")
-                    self.cbpi.notify('PIDRIMS AutoTune Error', "PIDRIMS AutoTune has failed", action=[NotificationAction("OK")])
+                    logging.error(f"AutoTune falhou. Estado final: {atune.state}")
+                    atune.log("AutoTune falhou")
+                    self.cbpi.notify('PIDRIMS AutoTune', "AutoTune falhou. Verifique os logs para mais detalhes.", action=[NotificationAction("OK")])
 
             except asyncio.CancelledError:
-                pass
+                logging.info("AutoTune cancelado pelo usuário")
+                raise
             except Exception as e:
-                logging.error("PIDRIMS AutoTune Error {}".format(e))
+                logging.error(f"Erro durante o AutoTune: {str(e)}")
+                self.cbpi.notify('PIDRIMS AutoTune', f"Erro durante o AutoTune: {str(e)}", NotificationType.ERROR)
             finally:
                 await self.stop()
 
         except Exception as e:
-            logging.error(f"Erro no run: {str(e)}")
+            logging.error(f"Erro no método run: {str(e)}")
+            self.cbpi.notify('PIDRIMS AutoTune', f"Erro no AutoTune: {str(e)}", NotificationType.ERROR)
+            await self.stop()
 
     def adjust_params_for_temp_behavior(self, params, high_temp_time):
         # Adjusts PID parameters based on observed thermal behavior
@@ -369,24 +398,31 @@ class AutoTuner(object):
 
 	def __init__(self, setpoint, outputstep=10, sampleTimeSec=5, lookbackSec=60,
 				 outputMin=float('-inf'), outputMax=float('inf'), noiseband=0.5, getTimeMs=None):
-		if setpoint is None:
-			raise ValueError('Kettle setpoint must be specified')
+		if setpoint is None or setpoint <= 0:
+			raise ValueError('Setpoint deve ser especificado e maior que zero')
 		if outputstep < 1:
-			raise ValueError('Output step % must be greater or equal to 1')
+			raise ValueError('Output step % deve ser maior ou igual a 1')
 		if sampleTimeSec < 1:
-			raise ValueError('Sample Time Seconds must be greater or equal to 1')
+			raise ValueError('Sample Time Seconds deve ser maior ou igual a 1')
 		if lookbackSec < sampleTimeSec:
-			raise ValueError('Lookback Seconds must be greater or equal to Sample Time Seconds (5)')
+			raise ValueError('Lookback Seconds deve ser maior ou igual a Sample Time Seconds (5)')
 		if outputMin >= outputMax:
-			raise ValueError('Min Output % must be less than Max Output %')
+			raise ValueError('Min Output % deve ser menor que Max Output %')
+		if noiseband <= 0:
+			raise ValueError('Noise Band deve ser maior que zero')
 
-		self._inputs = deque(maxlen=round(lookbackSec / sampleTimeSec))
-		self._sampleTime = sampleTimeSec * 1000
-		self._setpoint = setpoint
-		self._outputstep = outputstep
-		self._noiseband = noiseband
-		self._outputMin = outputMin
-		self._outputMax = outputMax
+		try:
+			self._inputs = deque(maxlen=round(lookbackSec / sampleTimeSec))
+			self._sampleTime = sampleTimeSec * 1000
+			self._setpoint = float(setpoint)  # Garante que setpoint é float
+			self._outputstep = float(outputstep)  # Garante que outputstep é float
+			self._noiseband = float(noiseband)  # Garante que noiseband é float
+			self._outputMin = float(outputMin)  # Garante que outputMin é float
+			self._outputMax = float(outputMax)  # Garante que outputMax é float
+		except ValueError as e:
+			raise ValueError(f'Erro ao converter parâmetros para float: {str(e)}')
+		except Exception as e:
+			raise ValueError(f'Erro ao inicializar parâmetros: {str(e)}')
 
 		self._state = AutoTuner.STATE_OFF
 		self._peakTimestamps = deque(maxlen=5)
@@ -405,6 +441,9 @@ class AutoTuner(object):
 			self._getTimeMs = self._currentTimeMs
 		else:
 			self._getTimeMs = getTimeMs
+
+		# Log da inicialização
+		logging.info(f"AutoTuner inicializado - Setpoint: {self._setpoint}, Output Step: {self._outputstep}, Sample Time: {sampleTimeSec}s, Lookback: {lookbackSec}s")
 
 	@property
 	def state(self):
