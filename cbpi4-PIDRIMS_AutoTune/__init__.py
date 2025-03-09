@@ -1,199 +1,197 @@
 # PIDRIMS AutoTune Plugin for CraftBeerPi 4
 # Based on the original PID AutoTune with modifications for RIMS systems
+# This plugin implements PID autotuning specifically for RIMS (Recirculating Infusion Mash System) brewing systems
+# It includes safety features to prevent the RIMS from overheating during the autotuning process
 # Author: Bruno Boccolini
 # License: GNU General Public License v3
 
-from time import localtime, strftime
-import time
+from time import localtime, strftime, time
 import math
 import logging
-import io
-from collections import deque
-from collections import namedtuple
+from collections import deque, namedtuple
 import asyncio
-from asyncio import tasks
-import logging
 from cbpi.api import *
-import datetime
-from cbpi.controller.kettle_controller import KettleController
-from socket import timeout
-from typing import KeysView
-
-from voluptuous.schema_builder import message
 from cbpi.api.dataclasses import NotificationAction, NotificationType
 
+# Plugin configuration parameters
+# These parameters can be adjusted through the CraftBeerPi interface
 @parameters([Property.Number(label = "Output_Step", configurable = True, default_value = 100, description="Default: 100. Sets the output power when stepping up/down."),
              Property.Number(label = "Max_Output", configurable = True, default_value = 100, description="Default: 100. Sets the maximum output power."),
-             Property.Number(label = "lockback_seconds", configurable = True, default_value = 30, description="Default: 30. Time in seconds to look for min/max temperatures."),
-             Property.Number(label = "rims_flow_threshold", configurable = True, default_value = 1.0, description="Default: 1.0. Minimum flow rate (L/min) for RIMS operation."),
-             Property.Number(label = "max_temp_difference", configurable = True, default_value = 5, description="Default: 5. Maximum temperature difference between RIMS in/out (°C)."),
-             Property.Number(label = "safety_margin", configurable = True, default_value = 2, description="Default: 2. Safety margin for temperature overshooting (°C)."),
+             Property.Number(label = "lookback_seconds", configurable = True, default_value = 30, description="Default: 30. Time in seconds to look for min/max temperatures."),
+             Property.Number(label = "max_temp_difference", configurable = True, default_value = 5, description="Default: 5. Maximum temperature difference between RIMS and target temp (°C)."),
              Property.Sensor(label="RIMS_Sensor", description="Sensor for measuring RIMS temperature"),
-             Property.Select(label="Flow_Sensor", description="Optional flow sensor for monitoring recirculation",
-                           options=[{"label": "None", "value": "None"}]),
              Property.Number(label = "SampleTime", configurable = True, default_value = 5, description="Default: 5. Sample time in seconds for PID calculation.")])
 
 class PIDRIMSAutotune(CBPiKettleLogic):
+    # Main class for RIMS PID Autotuning
+    # Implements safety checks and dynamic parameter adjustment based on system behavior
 
     def __init__(self, cbpi, id, props):
+        # Initialize the AutoTune plugin with necessary parameters and state variables
         super().__init__(cbpi, id, props)
         self._logger = logging.getLogger(type(self).__name__)
+        # Get configuration from properties
         self.rims_sensor = self.props.get("RIMS_Sensor", None)
-        self.flow_sensor = self.props.get("Flow_Sensor", None)
         self.sample_time = float(self.props.get("SampleTime", 5))
         self.max_temp_diff = float(self.props.get("max_temp_difference", 5))
-        self.safety_margin = float(self.props.get("safety_margin", 2))
-        self.flow_threshold = float(self.props.get("rims_flow_threshold", 1.0))
+        # Initialize state flags
+        self.finished = False
+        self.running = True
 
     async def autoOff(self):
-        self.finished=True
-
+        # Gracefully stop the autotuning process
+        self.finished = True
+        self.running = False
 
     async def on_stop(self):
-        if self.finished == False:
+        # Handle manual stop of the autotuning process
+        if not self.finished:
             self.cbpi.notify('PID AutoTune', 'Process stopped Manually. Please run Autotune again.', NotificationType.ERROR)
         await self.actor_off(self.heater)
         self.running = False
 
     async def run(self):
-        self.finished = False
+        # Main execution loop for the autotuning process
+        # Initialize system parameters and get current state
         self.kettle = self.get_kettle(self.id)
         self.heater = self.kettle.heater
         self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
-        fixedtarget = 67 if self.TEMP_UNIT == "C" else 153
+        fixedtarget = 67 if self.TEMP_UNIT == "C" else 153  # Default target if none is set
         setpoint = int(self.get_kettle_target_temp(self.id))
         current_value = self.get_sensor_value(self.kettle.sensor).get("value")
-        rims_value = self.get_sensor_value(self.rims_sensor).get("value") if self.rims_sensor else current_value
 
+        # Initial safety checks and target temperature validation
         if setpoint == 0:
             if fixedtarget < current_value:
                 self.cbpi.notify('PIDRIMS AutoTune', 'No target temperature defined and current temperature is above fallback value of {} °{}. Please set target temperature above current or wait until system cools down.'.format(fixedtarget,self.TEMP_UNIT), NotificationType.ERROR)
-                await self.actor_off(self.heater)
                 await self.stop()
+                return
             self.cbpi.notify('PIDRIMS AutoTune', 'No target temperature defined. System will set target to {} °{} and start AutoTune'.format(fixedtarget,self.TEMP_UNIT), NotificationType.WARNING)
             setpoint = fixedtarget
             await self.set_target_temp(self.id,setpoint)
     
         if setpoint < current_value:
             self.cbpi.notify('PIDRIMS AutoTune', 'Target temperature is below current temperature. Choose a higher setpoint or wait until temperature is below target and restart AutoTune', NotificationType.ERROR)
-            await self.actor_off(self.heater)
             await self.stop()
             return
 
-        # Flow check if sensor is configured
-        if self.flow_sensor and self.flow_sensor != "None":
-            flow_rate = self.get_sensor_value(self.flow_sensor).get("value", 0)
-            if flow_rate < self.flow_threshold:
-                self.cbpi.notify('PIDRIMS AutoTune', 'Flow rate too low ({}L/min). Minimum required: {}L/min'.format(flow_rate, self.flow_threshold), NotificationType.ERROR)
-                await self.actor_off(self.heater)
-                await self.stop()
-                return
-
         self.cbpi.notify('PIDRIMS AutoTune', 'AutoTune in Progress. Do not turn off Auto mode until AutoTune is complete', NotificationType.INFO)
         
-        sampleTime = self.sample_time
-        wait_time = 5
+        # Initialize AutoTune parameters
         outstep = float(self.props.get("Output_Step", 100))
         outmax = float(self.props.get("Max_Output", 100))
-        lookbackSec = float(self.props.get("lockback_seconds", 30))
+        lookbackSec = float(self.props.get("lookback_seconds", 30))
         heat_percent_old = 0
-        high_temp_diff_time = 0  # Accumulated time with high temperature difference
-        last_temp_check = time.time()
+        high_temp_diff_time = 0  # Tracks time spent at high temperatures
+        last_temp_check = time()
 
+        # Create and initialize AutoTuner
         try:
-            atune = AutoTuner(setpoint, outstep, sampleTime, lookbackSec, 0, outmax)
+            atune = AutoTuner(setpoint, outstep, self.sample_time, lookbackSec, 0, outmax)
         except Exception as e:
             self.cbpi.notify('PIDRIMS AutoTune', 'AutoTune Error: {}'.format(str(e)), NotificationType.ERROR)
             atune.log(str(e))
             await self.autoOff()
+            return
 
         atune.log("PIDRIMS AutoTune will now begin")
 
         try:
+            # Main autotuning loop
             await self.actor_on(self.heater, heat_percent_old)
-            while self.running == True and not atune.run(self.get_sensor_value(self.kettle.sensor).get("value")):
+            while self.running and not atune.run(self.get_sensor_value(self.kettle.sensor).get("value")):
                 heat_percent = atune.output
-                current_time = time.time()
-
-                # RIMS safety checks during autotune
+                current_time = time()
+                
+                # RIMS temperature safety monitoring
                 if self.rims_sensor:
                     rims_temp = self.get_sensor_value(self.rims_sensor).get("value")
-                    # Compare RIMS temperature with target temperature
-                    temp_diff = rims_temp - setpoint  # Note: Not using abs() anymore
+                    temp_diff = rims_temp - setpoint
                     time_elapsed = current_time - last_temp_check
                     
-                    # Only limit power if RIMS temperature is above setpoint
-                    if temp_diff > self.max_temp_diff:
-                        if heat_percent > 0:
-                            self.cbpi.notify('PIDRIMS AutoTune', 'RIMS temperature too high ({}°{} above target). Reducing power.'.format(temp_diff, self.TEMP_UNIT), NotificationType.WARNING)
-                        # Reduce power proportionally to temperature difference from target
-                        reduction_factor = self.max_temp_diff / temp_diff
-                        heat_percent = max(0, min(heat_percent * reduction_factor, atune.output))
+                    # Safety cutoff: stop heating if RIMS temperature exceeds limit
+                    if rims_temp > (setpoint + self.max_temp_diff):
+                        heat_percent = 0
                         high_temp_diff_time += time_elapsed
                         
-                        # Adjust autotune parameters based on thermal behavior
-                        if high_temp_diff_time > 30:  # After 30 seconds of high temperature
-                            atune._noiseband = min(2.0, atune._noiseband * 1.1)  # Gradually increase noise band
-                            atune._outputstep = max(20, atune._outputstep * 0.9)  # Gradually reduce output step
+                        # Dynamic adjustment of AutoTune parameters based on thermal behavior
+                        if high_temp_diff_time > 30:  # After 30 seconds at high temperature
+                            atune._noiseband = min(2.0, atune._noiseband * 1.1)  # Increase noise tolerance
+                            atune._outputstep = max(20, atune._outputstep * 0.9)  # Reduce power steps
+                        
+                        atune.log('RIMS temperature too high ({}°{}). Heating power set to 0%. High time: {:.1f}s'.format(
+                            rims_temp, self.TEMP_UNIT, high_temp_diff_time))
+                        self.cbpi.notify('PIDRIMS AutoTune', 'RIMS temperature too high ({}°{}). Heating disabled.'.format(
+                            rims_temp, self.TEMP_UNIT), NotificationType.WARNING)
                     else:
-                        # If RIMS temp is below or within acceptable range of setpoint, use full calculated power
-                        high_temp_diff_time = max(0, high_temp_diff_time - time_elapsed)  # Reduce accumulated time
+                        # Reset high temperature timer when temperature is normal
+                        high_temp_diff_time = max(0, high_temp_diff_time - time_elapsed)
 
+                # Update heater power if changed
                 if heat_percent != heat_percent_old:
                     await self.actor_set_power(self.heater, heat_percent)
                     heat_percent_old = heat_percent
-                    # Update log message to show if we're above or below setpoint
                     status = "above" if temp_diff > 0 else "below"
-                    atune.log('Power adjusted: {}%, RIMS {}°{} {} target, High Time: {:.1f}s'.format(
-                        heat_percent, abs(temp_diff) if self.rims_sensor else 0, self.TEMP_UNIT, status, high_temp_diff_time))
+                    atune.log('Power set to: {}%, RIMS {}°{} {} target, High time: {:.1f}s'.format(
+                        heat_percent, abs(temp_diff), self.TEMP_UNIT, status, high_temp_diff_time))
                 
                 last_temp_check = current_time
-                await asyncio.sleep(sampleTime)
+                await asyncio.sleep(self.sample_time)
 
-            await self.autoOff()
-        
+            # Process AutoTune results
             if atune.state == atune.STATE_SUCCEEDED:
                 atune.log("PIDRIMS AutoTune completed successfully")
                 atune.log("Total time with high temperature: {:.1f}s".format(high_temp_diff_time))
+                # Calculate PID parameters for each tuning rule
                 for rule in atune.tuningRules:
                     params = atune.getPIDParameters(rule)
-                    # Adjust parameters based on observed thermal behavior
-                    if high_temp_diff_time > 60:  # If had many high temperature periods
+                    # Adjust parameters if system showed tendency to overheat
+                    if high_temp_diff_time > 60:
                         params = self.adjust_params_for_temp_behavior(params, high_temp_diff_time)
                     atune.log('rule: {0}'.format(rule))
                     atune.log('P: {0}'.format(params.Kp))
                     atune.log('I: {0}'.format(params.Ki))
                     atune.log('D: {0}'.format(params.Kd))
-                    if rule == "rims-moderate":  # Using RIMS rule as default
+                    # Use RIMS-specific moderate tuning rule
+                    if rule == "rims-moderate":
                         self.cbpi.notify('AutoTune completed successfully',
                             "P Value: %.8f | I Value: %.8f | D Value: %.8f" % (params.Kp, params.Ki, params.Kd),
                             action=[NotificationAction("OK")])
-            elif atune.state == atune.STATE_FAILED:
+            else:
                 atune.log("PIDRIMS AutoTune failed")
                 self.cbpi.notify('PIDRIMS AutoTune Error', "PIDRIMS AutoTune has failed", action=[NotificationAction("OK")])
 
-        except asyncio.CancelledError as e:
+        except asyncio.CancelledError:
             pass
         except Exception as e:
             logging.error("PIDRIMS AutoTune Error {}".format(e))
-            await self.actor_off(self.heater)
-            await self.stop()
-            pass
         finally:
-            await self.actor_off(self.heater)
             await self.stop()
-            pass
+
+    async def stop(self):
+        # Clean shutdown of the autotuning process
+        await self.actor_off(self.heater)
+        await self.autoOff()
 
     def adjust_params_for_temp_behavior(self, params, high_temp_time):
-        """Adjusts PID parameters based on observed thermal behavior"""
-        # The more time in high temperature, the more conservative the parameters
+        # Adjusts PID parameters based on observed thermal behavior
+        #
+        # Args:
+        #     params: Current PID parameters
+        #     high_temp_time: Time spent at high temperatures
+        #            
+        # Returns:
+        #     Adjusted PID parameters optimized for RIMS safety
+        
+        # Calculate adjustment factor based on time spent at high temperatures
         adjustment_factor = min(1.5, 1 + (high_temp_time / 300))  # Maximum 50% adjustment
         
-        # Increase P for faster response
+        # Adjust each parameter for better temperature control:
+        # - Increase P for faster response to temperature changes
+        # - Reduce I to minimize overshoot
+        # - Increase D for better overshoot prevention
         Kp = params.Kp * adjustment_factor
-        # Reduce I to avoid overshoot
         Ki = params.Ki / adjustment_factor
-        # Increase D for better overshoot control
         Kd = params.Kd * adjustment_factor
         
         return self.PIDParams(Kp=Kp, Ki=Ki, Kd=Kd)
