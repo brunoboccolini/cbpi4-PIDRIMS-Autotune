@@ -40,78 +40,118 @@ class PIDRIMSAutotune(CBPiKettleLogic):
         self.finished = False
         self.running = False
         self.auto_mode = False
+        self.heater = None
+        self.kettle = None
 
     async def on_start(self):
         # Chamado quando o Auto Mode é ligado
-        self.running = True
-        self.auto_mode = True
-        # Liga a bomba primeiro
-        if not await self.start_pump():
-            self.cbpi.notify('PIDRIMS AutoTune', 'Falha ao ligar a bomba. AutoTune não pode iniciar.', NotificationType.ERROR)
+        try:
+            self.kettle = self.get_kettle(self.id)
+            self.heater = self.kettle.heater
+            
+            # Verifica se a bomba está configurada
+            if not self.pump:
+                self.cbpi.notify('PIDRIMS AutoTune', 'Bomba não configurada!', NotificationType.ERROR)
+                await self.stop()
+                return
+
+            # Liga a bomba primeiro
+            await self.actor_on(self.pump, 100)
+            await asyncio.sleep(2)  # Aguarda a bomba estabilizar
+
+            # Verifica se a bomba está funcionando
+            if self.cbpi.actor.find_by_id(self.pump).power <= 0:
+                self.cbpi.notify('PIDRIMS AutoTune', 'Falha ao ligar a bomba!', NotificationType.ERROR)
+                await self.stop()
+                return
+
+            # Se chegou aqui, a bomba está funcionando
+            self.running = True
+            self.auto_mode = True
+            
+        except Exception as e:
+            logging.error(f"Erro no on_start: {str(e)}")
             await self.stop()
             return
-        # Liga o aquecedor
-        await self.actor_on(self.heater, 0)
-
-    async def check_pump_status(self):
-        # Check if pump is running
-        if self.pump:
-            pump_power = self.cbpi.actor.find_by_id(self.pump).power
-            if pump_power <= 0:
-                self.cbpi.notify('PIDRIMS AutoTune', 'Bomba parou! Interrompendo AutoTune por segurança.', NotificationType.ERROR)
-                await self.stop()
-                return False
-        return True
-
-    async def start_pump(self):
-        # Start the recirculation pump
-        if self.pump:
-            await self.actor_on(self.pump, 100)
-            # Wait a moment to ensure pump is running
-            await asyncio.sleep(2)
-            if not await self.check_pump_status():
-                return False
-        return True
-
-    async def stop_pump(self):
-        # Stop the recirculation pump only if Auto Mode is off
-        if self.pump and not self.auto_mode:
-            await self.actor_off(self.pump)
-
-    async def autoOff(self):
-        # Gracefully stop the autotuning process
-        self.finished = True
-        self.running = False
-        self.auto_mode = False
-        # Força o desligamento do aquecedor
-        await self.actor_off(self.heater)
-        # Força o estado do kettle para false para liberar o botão Auto Mode
-        kettle = self.get_kettle(self.id)
-        await self.cbpi.kettle.toggle(kettle.id)
 
     async def on_stop(self):
-        # Handle manual stop of the autotuning process
-        self.auto_mode = False
-        if not self.finished:
-            self.cbpi.notify('PID AutoTune', 'Processo interrompido manualmente. Execute o AutoTune novamente.', NotificationType.ERROR)
-        await self.actor_off(self.heater)  # Desliga o aquecedor RIMS
-        self.running = False
-        # Força o estado do kettle para false para liberar o botão Auto Mode
-        kettle = self.get_kettle(self.id)
-        await self.cbpi.kettle.toggle(kettle.id)
+        try:
+            # Primeiro desliga o aquecedor
+            if self.heater:
+                await self.actor_off(self.heater)
+
+            # Atualiza os estados
+            self.running = False
+            self.auto_mode = False
+            
+            # Força o estado do kettle para false
+            if self.kettle and self.kettle.instance:
+                self.kettle.instance.state = False
+                await self.cbpi.kettle.update(self.id)
+                
+            # Notifica o usuário
+            if not self.finished:
+                self.cbpi.notify('PIDRIMS AutoTune', 'Processo interrompido manualmente.', NotificationType.INFO)
+
+        except Exception as e:
+            logging.error(f"Erro no on_stop: {str(e)}")
+        finally:
+            # Garante que o aquecedor está desligado
+            if self.heater:
+                await self.actor_off(self.heater)
+
+    async def check_pump_status(self):
+        if not self.pump:
+            return False
+        try:
+            pump_power = self.cbpi.actor.find_by_id(self.pump).power
+            if pump_power <= 0:
+                self.cbpi.notify('PIDRIMS AutoTune', 'Bomba parou! Interrompendo processo.', NotificationType.ERROR)
+                await self.stop()
+                return False
+            return True
+        except Exception as e:
+            logging.error(f"Erro ao verificar bomba: {str(e)}")
+            return False
+
+    async def stop(self):
+        try:
+            # Primeiro desliga o aquecedor
+            if self.heater:
+                await self.actor_off(self.heater)
+
+            # Atualiza estados
+            self.running = False
+            self.auto_mode = False
+            
+            # Força o estado do kettle para false
+            if self.kettle and self.kettle.instance:
+                self.kettle.instance.state = False
+                await self.cbpi.kettle.update(self.id)
+
+        except Exception as e:
+            logging.error(f"Erro ao parar: {str(e)}")
+        finally:
+            # Garante que o aquecedor está desligado
+            if self.heater:
+                await self.actor_off(self.heater)
 
     async def check_auto_mode(self):
-        # Verifica se o Auto Mode está ativo
-        kettle = self.get_kettle(self.id)
-        if not kettle.instance.state and self.auto_mode:  # Auto Mode foi desligado
-            self.auto_mode = False
-            self.cbpi.notify('PIDRIMS AutoTune', 'Auto Mode desligado. Interrompendo AutoTune.', NotificationType.INFO)
-            await self.stop()
+        try:
+            if not self.kettle:
+                self.kettle = self.get_kettle(self.id)
+
+            if not self.kettle.instance.state and self.auto_mode:
+                # Auto Mode foi desligado
+                self.auto_mode = False
+                await self.stop()
+                return False
+            
+            return self.auto_mode
+
+        except Exception as e:
+            logging.error(f"Erro ao verificar Auto Mode: {str(e)}")
             return False
-        elif kettle.instance.state and not self.auto_mode:  # Auto Mode foi ligado
-            self.auto_mode = True
-            await self.on_start()
-        return self.auto_mode
 
     async def run(self):
         # Main execution loop for the autotuning process
@@ -267,16 +307,6 @@ class PIDRIMSAutotune(CBPiKettleLogic):
             logging.error("PIDRIMS AutoTune Error {}".format(e))
         finally:
             await self.stop()
-
-    async def stop(self):
-        # Clean shutdown of the autotuning process
-        self.auto_mode = False
-        await self.actor_off(self.heater)  # Desliga o aquecedor RIMS
-        # Não desliga a bomba automaticamente
-        await self.autoOff()
-        # Força o estado do kettle para false para liberar o botão Auto Mode
-        kettle = self.get_kettle(self.id)
-        await self.cbpi.kettle.toggle(kettle.id)
 
     def adjust_params_for_temp_behavior(self, params, high_temp_time):
         # Adjusts PID parameters based on observed thermal behavior
