@@ -118,14 +118,15 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                 # RIMS safety checks during autotune
                 if self.rims_sensor:
                     rims_temp = self.get_sensor_value(self.rims_sensor).get("value")
-                    mlt_temp = self.get_sensor_value(self.kettle.sensor).get("value")
-                    temp_diff = abs(rims_temp - mlt_temp)
+                    # Compare RIMS temperature with target temperature
+                    temp_diff = rims_temp - setpoint  # Note: Not using abs() anymore
                     time_elapsed = current_time - last_temp_check
                     
+                    # Only limit power if RIMS temperature is above setpoint
                     if temp_diff > self.max_temp_diff:
                         if heat_percent > 0:
-                            self.cbpi.notify('PIDRIMS AutoTune', 'High RIMS temperature difference ({}°{}). Reducing power.'.format(temp_diff, self.TEMP_UNIT), NotificationType.WARNING)
-                        # Reduce power proportionally to temperature difference
+                            self.cbpi.notify('PIDRIMS AutoTune', 'RIMS temperature too high ({}°{} above target). Reducing power.'.format(temp_diff, self.TEMP_UNIT), NotificationType.WARNING)
+                        # Reduce power proportionally to temperature difference from target
                         reduction_factor = self.max_temp_diff / temp_diff
                         heat_percent = max(0, min(heat_percent * reduction_factor, atune.output))
                         high_temp_diff_time += time_elapsed
@@ -135,13 +136,16 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                             atune._noiseband = min(2.0, atune._noiseband * 1.1)  # Gradually increase noise band
                             atune._outputstep = max(20, atune._outputstep * 0.9)  # Gradually reduce output step
                     else:
+                        # If RIMS temp is below or within acceptable range of setpoint, use full calculated power
                         high_temp_diff_time = max(0, high_temp_diff_time - time_elapsed)  # Reduce accumulated time
 
                 if heat_percent != heat_percent_old:
                     await self.actor_set_power(self.heater, heat_percent)
                     heat_percent_old = heat_percent
-                    atune.log('Power adjusted: {}%, Temp Diff: {}°{}, High Time: {:.1f}s'.format(
-                        heat_percent, temp_diff if self.rims_sensor else 0, self.TEMP_UNIT, high_temp_diff_time))
+                    # Update log message to show if we're above or below setpoint
+                    status = "above" if temp_diff > 0 else "below"
+                    atune.log('Power adjusted: {}%, RIMS {}°{} {} target, High Time: {:.1f}s'.format(
+                        heat_percent, abs(temp_diff) if self.rims_sensor else 0, self.TEMP_UNIT, status, high_temp_diff_time))
                 
                 last_temp_check = current_time
                 await asyncio.sleep(sampleTime)
