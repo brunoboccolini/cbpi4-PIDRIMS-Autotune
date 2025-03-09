@@ -418,7 +418,6 @@ class AutoTuner(object):
 		self._state = AutoTuner.STATE_RELAY_STEP_UP
 
 def setup(cbpi):
-
     '''
     This method is called by the server during startup 
     Here you need to register your plugins at the server
@@ -426,5 +425,7 @@ def setup(cbpi):
     :param cbpi: the cbpi core 
     :return: 
     '''
-
-    cbpi.plugin.register("PIDRIMSAutotune", PIDRIMSAutotune)
+    cbpi.plugin.register("PIDRIMSAutoTune", PIDRIMSAutotune)
+    # Make sure the plugin is registered as a KettleLogic
+    if PIDRIMSAutotune not in cbpi.kettle.types:
+        cbpi.kettle.types.append(PIDRIMSAutotune)
