@@ -429,7 +429,7 @@ def setup(cbpi):
     :param cbpi: the cbpi core 
     :return: 
     '''
+    # Register the plugin with the correct name
     cbpi.plugin.register("PIDRIMSAutoTune", PIDRIMSAutotune)
-    # Make sure the plugin is registered as a KettleLogic
-    if PIDRIMSAutotune not in cbpi.kettle.types:
-        cbpi.kettle.types.append(PIDRIMSAutotune)
+    # Register the plugin as a kettle logic type
+    cbpi.kettle.types["PIDRIMSAutoTune"] = PIDRIMSAutotune
