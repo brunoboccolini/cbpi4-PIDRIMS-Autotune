@@ -78,6 +78,15 @@ class PIDRIMSAutotune(CBPiKettleLogic):
         await self.stop_pump()  # Turn off pump
         self.running = False
 
+    async def check_auto_mode(self):
+        # Verifica se o Auto Mode está ativo
+        kettle = self.get_kettle(self.id)
+        if not kettle.instance.state:  # state False significa Auto Mode desligado
+            self.cbpi.notify('PIDRIMS AutoTune', 'Auto Mode desligado. Interrompendo AutoTune.', NotificationType.INFO)
+            await self.stop()
+            return False
+        return True
+
     async def run(self):
         # Main execution loop for the autotuning process
         # Initialize system parameters and get current state
@@ -148,6 +157,10 @@ class PIDRIMSAutotune(CBPiKettleLogic):
             # Main autotuning loop
             await self.actor_on(self.heater, heat_percent_old)  # Ensure RIMS heater is on
             while self.running and not atune.run(self.get_sensor_value(self.kettle.sensor).get("value")):
+                # Verifica o estado do Auto Mode
+                if not await self.check_auto_mode():
+                    return
+
                 # Check pump status first
                 if not await self.check_pump_status():
                     return
