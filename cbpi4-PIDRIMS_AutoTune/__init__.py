@@ -167,8 +167,8 @@ class PIDRIMSAutotune(CBPiKettleLogic):
             self.heater = self.kettle.heater
             self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
             fixedtarget = 67 if self.TEMP_UNIT == "C" else 153  # Default target if none is set
-            setpoint = int(self.get_kettle_target_temp(self.id))
-            current_value = self.get_sensor_value(self.kettle.sensor).get("value")
+            setpoint = float(self.get_kettle_target_temp(self.id))  # Convertido para float
+            current_value = float(self.get_sensor_value(self.kettle.sensor).get("value"))  # Convertido para float
 
             # Log initial values for debugging
             logging.info(f"Iniciando AutoTune com os seguintes valores:")
@@ -195,14 +195,14 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                 return
 
             # Initial safety checks and target temperature validation
-            if setpoint == 0:
+            if setpoint <= 0:
                 if fixedtarget < current_value:
                     self.cbpi.notify('PIDRIMS AutoTune', f'Temperatura alvo não definida e temperatura atual está acima do valor padrão de {fixedtarget}°{self.TEMP_UNIT}. Por favor, defina uma temperatura alvo acima da atual ou aguarde o sistema esfriar.', NotificationType.ERROR)
                     await self.stop()
                     return
                 self.cbpi.notify('PIDRIMS AutoTune', f'Temperatura alvo não definida. Sistema usará {fixedtarget}°{self.TEMP_UNIT} como alvo', NotificationType.WARNING)
-                setpoint = fixedtarget
-                await self.set_target_temp(self.id,setpoint)
+                setpoint = float(fixedtarget)  # Convertido para float
+                await self.set_target_temp(self.id, setpoint)
         
             if setpoint < current_value:
                 self.cbpi.notify('PIDRIMS AutoTune', 'Temperatura alvo está abaixo da temperatura atual. Escolha um setpoint mais alto ou aguarde a temperatura baixar e reinicie o AutoTune', NotificationType.ERROR)
@@ -220,6 +220,11 @@ class PIDRIMSAutotune(CBPiKettleLogic):
             if outstep <= 0 or outmax <= 0 or lookbackSec <= 0:
                 raise ValueError(f"Parâmetros inválidos: Output Step={outstep}, Max Output={outmax}, Lookback Seconds={lookbackSec}")
 
+            # Garante valores mínimos seguros
+            outstep = max(20, min(outstep, outmax))  # Entre 20% e outmax
+            lookbackSec = max(10, lookbackSec)  # Mínimo 10 segundos
+            noiseband = 0.5  # Banda de ruído fixa para início
+
             heat_percent_old = 0
             high_temp_diff_time = 0
             last_temp_check = time()
@@ -233,9 +238,10 @@ class PIDRIMSAutotune(CBPiKettleLogic):
                     lookbackSec=lookbackSec,
                     outputMin=0,
                     outputMax=outmax,
-                    noiseband=0.5
+                    noiseband=noiseband
                 )
                 logging.info("AutoTuner inicializado com sucesso")
+                logging.info(f"Parâmetros - Setpoint: {setpoint}, Output Step: {outstep}, Sample Time: {self.sample_time}, Lookback: {lookbackSec}, Noise Band: {noiseband}")
             except Exception as e:
                 logging.error(f"Erro ao inicializar AutoTuner: {str(e)}")
                 self.cbpi.notify('PIDRIMS AutoTune', f'Erro ao inicializar AutoTune: {str(e)}', NotificationType.ERROR)
@@ -474,28 +480,47 @@ class AutoTuner(object):
 	def run(self, inputValue):
 		now = self._getTimeMs()
 
+		# Log do valor de entrada e estado atual
+		logging.info(f"AutoTuner.run - Input: {inputValue}, Estado: {self._state}, Timestamp: {now}")
+
 		if (self._state == AutoTuner.STATE_OFF
 				or self._state == AutoTuner.STATE_SUCCEEDED
 				or self._state == AutoTuner.STATE_FAILED):
-			self._initTuner(inputValue, now)
-		elif (now - self._lastRunTimestamp) < self._sampleTime:
+			try:
+				self._initTuner(inputValue, now)
+				logging.info(f"AutoTuner reinicializado - Estado: {self._state}")
+				self.log(f"AutoTuner reinicializado - Input: {inputValue}")
+			except Exception as e:
+				logging.error(f"Erro ao inicializar tuner: {str(e)}")
+				self._state = AutoTuner.STATE_FAILED
+				return True
+
+		# Verifica se já passou tempo suficiente desde a última execução
+		if (now - self._lastRunTimestamp) < self._sampleTime:
+			logging.debug(f"Aguardando tempo de amostragem - Decorrido: {now - self._lastRunTimestamp}ms")
 			return False
 
 		self._lastRunTimestamp = now
 
+		# Log dos valores atuais
+		logging.info(f"Estado atual - Input: {inputValue}, Setpoint: {self._setpoint}, Noise Band: {self._noiseband}")
+		
 		# check input and change relay state if necessary
 		if (self._state == AutoTuner.STATE_RELAY_STEP_UP
 				and inputValue > self._setpoint + self._noiseband):
 			self._state = AutoTuner.STATE_RELAY_STEP_DOWN
-			self.log('switched state: {0}'.format(self._state))
-			self.log('input: {0}'.format(inputValue))
+			logging.info(f"Mudando para STEP_DOWN - Input: {inputValue} > Setpoint+Noise: {self._setpoint + self._noiseband}")
+			self.log(f'Mudando estado para: {self._state}')
+			self.log(f'Input: {inputValue}')
 		elif (self._state == AutoTuner.STATE_RELAY_STEP_DOWN
 				and inputValue < self._setpoint - self._noiseband):
 			self._state = AutoTuner.STATE_RELAY_STEP_UP
-			self.log('switched state: {0}'.format(self._state))
-			self.log('input: {0}'.format(inputValue))
+			logging.info(f"Mudando para STEP_UP - Input: {inputValue} < Setpoint-Noise: {self._setpoint - self._noiseband}")
+			self.log(f'Mudando estado para: {self._state}')
+			self.log(f'Input: {inputValue}')
 
 		# set output
+		old_output = self._output
 		if (self._state == AutoTuner.STATE_RELAY_STEP_UP):
 			self._output = self._initialOutput + self._outputstep
 		elif self._state == AutoTuner.STATE_RELAY_STEP_DOWN:
@@ -504,6 +529,9 @@ class AutoTuner(object):
 		# respect output limits
 		self._output = min(self._output, self._outputMax)
 		self._output = max(self._output, self._outputMin)
+
+		if old_output != self._output:
+			logging.info(f"Saída atualizada: {self._output}% (anterior: {old_output}%)")
 
 		# identify peaks
 		isMax = True
@@ -515,8 +543,12 @@ class AutoTuner(object):
 
 		self._inputs.append(inputValue)
 
+		# Log do estado do buffer de entradas
+		logging.debug(f"Buffer de entradas: {len(self._inputs)}/{self._inputs.maxlen}")
+
 		# we don't want to trust the maxes or mins until the input array is full
 		if len(self._inputs) < self._inputs.maxlen:
+			logging.info(f"Aguardando buffer encher: {len(self._inputs)}/{self._inputs.maxlen}")
 			return False
 
 		# increment peak count and record peak time for maxima and minima
@@ -539,8 +571,9 @@ class AutoTuner(object):
 			self._peakCount += 1
 			self._peaks.append(inputValue)
 			self._peakTimestamps.append(now)
-			self.log('found peak: {0}'.format(inputValue))
-			self.log('peak count: {0}'.format(self._peakCount))
+			logging.info(f"Pico encontrado: {inputValue} (total: {self._peakCount})")
+			self.log(f'Pico encontrado: {inputValue}')
+			self.log(f'Total de picos: {self._peakCount}')
 
 		# check for convergence of induced oscillation
 		# convergence of amplitude assessed on last 4 peaks (1.5 cycles)
@@ -560,15 +593,18 @@ class AutoTuner(object):
 			amplitudeDev = ((0.5 * (absMax - absMin) - self._inducedAmplitude)
 							/ self._inducedAmplitude)
 
-			self.log('amplitude: {0}'.format(self._inducedAmplitude))
-			self.log('amplitude deviation: {0}'.format(amplitudeDev))
+			logging.info(f"Amplitude: {self._inducedAmplitude}, Desvio: {amplitudeDev}")
+			self.log(f'Amplitude: {self._inducedAmplitude}')
+			self.log(f'Desvio de amplitude: {amplitudeDev}')
 
 			if amplitudeDev < AutoTuner.PEAK_AMPLITUDE_TOLERANCE:
 				self._state = AutoTuner.STATE_SUCCEEDED
+				logging.info("AutoTune convergiu com sucesso!")
 
 		# if the autotune has not already converged
 		# terminate after 10 cycles
 		if self._peakCount >= 20:
+			logging.error("AutoTune falhou - Número máximo de picos atingido sem convergência")
 			self._output = 0
 			self._state = AutoTuner.STATE_FAILED
 			return True
@@ -583,6 +619,8 @@ class AutoTuner(object):
 			period1 = self._peakTimestamps[3] - self._peakTimestamps[1]
 			period2 = self._peakTimestamps[4] - self._peakTimestamps[2]
 			self._Pu = 0.5 * (period1 + period2) / 1000.0
+			
+			logging.info(f"Parâmetros finais - Ku: {self._Ku}, Pu: {self._Pu}")
 			return True
 
 		return False
@@ -591,17 +629,23 @@ class AutoTuner(object):
 		return time.time() * 1000
 
 	def _initTuner(self, inputValue, timestamp):
-		self._peakType = 0
-		self._peakCount = 0
-		self._output = 0
-		self._initialOutput = 0
-		self._Ku = 0
-		self._Pu = 0
-		self._inputs.clear()
-		self._peaks.clear()
-		self._peakTimestamps.clear()
-		self._peakTimestamps.append(timestamp)
-		self._state = AutoTuner.STATE_RELAY_STEP_UP
+		try:
+			logging.info(f"Iniciando AutoTuner - Input: {inputValue}, Timestamp: {timestamp}")
+			self._peakType = 0
+			self._peakCount = 0
+			self._output = 0
+			self._initialOutput = 0
+			self._Ku = 0
+			self._Pu = 0
+			self._inputs.clear()
+			self._peaks.clear()
+			self._peakTimestamps.clear()
+			self._peakTimestamps.append(timestamp)
+			self._state = AutoTuner.STATE_RELAY_STEP_UP
+			logging.info("AutoTuner inicializado com sucesso")
+		except Exception as e:
+			logging.error(f"Erro ao inicializar AutoTuner: {str(e)}")
+			raise
 
 def setup(cbpi):
     '''
