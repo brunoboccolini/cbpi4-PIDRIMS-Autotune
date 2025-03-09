@@ -20,6 +20,7 @@ from cbpi.api.dataclasses import NotificationAction, NotificationType
              Property.Number(label = "lookback_seconds", configurable = True, default_value = 30, description="Default: 30. Time in seconds to look for min/max temperatures."),
              Property.Number(label = "max_temp_difference", configurable = True, default_value = 5, description="Default: 5. Maximum temperature difference between RIMS and target temp (°C)."),
              Property.Sensor(label="RIMS_Sensor", description="Sensor for measuring RIMS temperature"),
+             Property.Actor(label="Pump", description="Pump actor for RIMS recirculation"),
              Property.Number(label = "SampleTime", configurable = True, default_value = 5, description="Default: 5. Sample time in seconds for PID calculation.")])
 
 class PIDRIMSAutotune(CBPiKettleLogic):
@@ -32,11 +33,37 @@ class PIDRIMSAutotune(CBPiKettleLogic):
         self._logger = logging.getLogger(type(self).__name__)
         # Get configuration from properties
         self.rims_sensor = self.props.get("RIMS_Sensor", None)
+        self.pump = self.props.get("Pump", None)
         self.sample_time = float(self.props.get("SampleTime", 5))
         self.max_temp_diff = float(self.props.get("max_temp_difference", 5))
         # Initialize state flags
         self.finished = False
         self.running = True
+
+    async def check_pump_status(self):
+        # Check if pump is running
+        if self.pump:
+            pump_power = self.cbpi.actor.find_by_id(self.pump).power
+            if pump_power <= 0:
+                self.cbpi.notify('PIDRIMS AutoTune', 'Pump stopped! Stopping AutoTune for safety.', NotificationType.ERROR)
+                await self.stop()
+                return False
+        return True
+
+    async def start_pump(self):
+        # Start the recirculation pump
+        if self.pump:
+            await self.actor_on(self.pump, 100)
+            # Wait a moment to ensure pump is running
+            await asyncio.sleep(2)
+            if not await self.check_pump_status():
+                return False
+        return True
+
+    async def stop_pump(self):
+        # Stop the recirculation pump
+        if self.pump:
+            await self.actor_off(self.pump)
 
     async def autoOff(self):
         # Gracefully stop the autotuning process
@@ -47,7 +74,8 @@ class PIDRIMSAutotune(CBPiKettleLogic):
         # Handle manual stop of the autotuning process
         if not self.finished:
             self.cbpi.notify('PID AutoTune', 'Process stopped Manually. Please run Autotune again.', NotificationType.ERROR)
-        await self.actor_off(self.heater)
+        await self.actor_off(self.heater)  # Turn off RIMS heater
+        await self.stop_pump()  # Turn off pump
         self.running = False
 
     async def run(self):
@@ -59,6 +87,26 @@ class PIDRIMSAutotune(CBPiKettleLogic):
         fixedtarget = 67 if self.TEMP_UNIT == "C" else 153  # Default target if none is set
         setpoint = int(self.get_kettle_target_temp(self.id))
         current_value = self.get_sensor_value(self.kettle.sensor).get("value")
+
+        # Verify RIMS sensor configuration
+        if not self.rims_sensor:
+            self.cbpi.notify('PIDRIMS AutoTune', 'RIMS sensor not configured. AutoTune cannot proceed safely.', NotificationType.ERROR)
+            await self.stop()
+            return
+
+        # Verify pump configuration
+        if not self.pump:
+            self.cbpi.notify('PIDRIMS AutoTune', 'Pump not configured. AutoTune cannot proceed safely.', NotificationType.ERROR)
+            await self.stop()
+            return
+
+        # Start pump and verify it's running
+        if not await self.start_pump():
+            return
+
+        # Log initial configuration
+        logging.info("AutoTune starting with: Setpoint={}°{}, RIMS Sensor={}, Pump={}, Max Temp Diff={}°{}".format(
+            setpoint, self.TEMP_UNIT, self.rims_sensor, self.pump, self.max_temp_diff, self.TEMP_UNIT))
 
         # Initial safety checks and target temperature validation
         if setpoint == 0:
@@ -98,34 +146,47 @@ class PIDRIMSAutotune(CBPiKettleLogic):
 
         try:
             # Main autotuning loop
-            await self.actor_on(self.heater, heat_percent_old)
+            await self.actor_on(self.heater, heat_percent_old)  # Ensure RIMS heater is on
             while self.running and not atune.run(self.get_sensor_value(self.kettle.sensor).get("value")):
+                # Check pump status first
+                if not await self.check_pump_status():
+                    return
+
                 heat_percent = atune.output
                 current_time = time()
                 
                 # RIMS temperature safety monitoring
-                if self.rims_sensor:
-                    rims_temp = self.get_sensor_value(self.rims_sensor).get("value")
-                    temp_diff = rims_temp - setpoint
-                    time_elapsed = current_time - last_temp_check
+                rims_temp = self.get_sensor_value(self.rims_sensor).get("value")
+                mlt_temp = self.get_sensor_value(self.kettle.sensor).get("value")
+                temp_diff = rims_temp - setpoint
+                time_elapsed = current_time - last_temp_check
+
+                # Log temperatures for debugging
+                logging.info("Temps - RIMS: {}°{}, MLT: {}°{}, Setpoint: {}°{}, Power: {}%".format(
+                    rims_temp, self.TEMP_UNIT, mlt_temp, self.TEMP_UNIT, setpoint, self.TEMP_UNIT, heat_percent))
+                
+                # Safety cutoff: stop heating if RIMS temperature exceeds limit
+                if rims_temp > (setpoint + self.max_temp_diff):
+                    heat_percent = 0
+                    high_temp_diff_time += time_elapsed
                     
-                    # Safety cutoff: stop heating if RIMS temperature exceeds limit
-                    if rims_temp > (setpoint + self.max_temp_diff):
-                        heat_percent = 0
-                        high_temp_diff_time += time_elapsed
-                        
-                        # Dynamic adjustment of AutoTune parameters based on thermal behavior
-                        if high_temp_diff_time > 30:  # After 30 seconds at high temperature
-                            atune._noiseband = min(2.0, atune._noiseband * 1.1)  # Increase noise tolerance
-                            atune._outputstep = max(20, atune._outputstep * 0.9)  # Reduce power steps
-                        
-                        atune.log('RIMS temperature too high ({}°{}). Heating power set to 0%. High time: {:.1f}s'.format(
-                            rims_temp, self.TEMP_UNIT, high_temp_diff_time))
-                        self.cbpi.notify('PIDRIMS AutoTune', 'RIMS temperature too high ({}°{}). Heating disabled.'.format(
-                            rims_temp, self.TEMP_UNIT), NotificationType.WARNING)
-                    else:
-                        # Reset high temperature timer when temperature is normal
-                        high_temp_diff_time = max(0, high_temp_diff_time - time_elapsed)
+                    # Dynamic adjustment of AutoTune parameters based on thermal behavior
+                    if high_temp_diff_time > 30:  # After 30 seconds at high temperature
+                        atune._noiseband = min(2.0, atune._noiseband * 1.1)  # Increase noise tolerance
+                        atune._outputstep = max(20, atune._outputstep * 0.9)  # Reduce power steps
+                    
+                    atune.log('RIMS temperature too high ({}°{}). Heating power set to 0%. High time: {:.1f}s'.format(
+                        rims_temp, self.TEMP_UNIT, high_temp_diff_time))
+                    self.cbpi.notify('PIDRIMS AutoTune', 'RIMS temperature too high ({}°{}). Heating disabled.'.format(
+                        rims_temp, self.TEMP_UNIT), NotificationType.WARNING)
+
+                    # Force power update
+                    if heat_percent_old != 0:
+                        await self.actor_set_power(self.heater, 0)
+                        heat_percent_old = 0
+                else:
+                    # Reset high temperature timer when temperature is normal
+                    high_temp_diff_time = max(0, high_temp_diff_time - time_elapsed)
 
                 # Update heater power if changed
                 if heat_percent != heat_percent_old:
@@ -170,7 +231,8 @@ class PIDRIMSAutotune(CBPiKettleLogic):
 
     async def stop(self):
         # Clean shutdown of the autotuning process
-        await self.actor_off(self.heater)
+        await self.actor_off(self.heater)  # Turn off RIMS heater
+        await self.stop_pump()  # Turn off pump
         await self.autoOff()
 
     def adjust_params_for_temp_behavior(self, params, high_temp_time):
