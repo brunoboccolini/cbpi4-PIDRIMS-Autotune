@@ -478,152 +478,175 @@ class AutoTuner(object):
 			file.write("%s,%s\n" % (formatted_time, text))
 		
 	def run(self, inputValue):
-		now = self._getTimeMs()
+		try:
+			now = self._getTimeMs()
 
-		# Log do valor de entrada e estado atual
-		logging.info(f"AutoTuner.run - Input: {inputValue}, Estado: {self._state}, Timestamp: {now}")
+			# Log do valor de entrada e estado atual
+			logging.info(f"AutoTuner.run - Input: {inputValue}, Estado: {self._state}, Timestamp: {now}")
 
-		if (self._state == AutoTuner.STATE_OFF
-				or self._state == AutoTuner.STATE_SUCCEEDED
-				or self._state == AutoTuner.STATE_FAILED):
-			try:
-				self._initTuner(inputValue, now)
-				logging.info(f"AutoTuner reinicializado - Estado: {self._state}")
-				self.log(f"AutoTuner reinicializado - Input: {inputValue}")
-			except Exception as e:
-				logging.error(f"Erro ao inicializar tuner: {str(e)}")
+			# Verifica se o valor de entrada é válido
+			if inputValue is None:
+				logging.error("Valor de entrada inválido (None)")
 				self._state = AutoTuner.STATE_FAILED
 				return True
 
-		# Verifica se já passou tempo suficiente desde a última execução
-		if (now - self._lastRunTimestamp) < self._sampleTime:
-			logging.debug(f"Aguardando tempo de amostragem - Decorrido: {now - self._lastRunTimestamp}ms")
+			# Converte para float se necessário
+			try:
+				inputValue = float(inputValue)
+			except (TypeError, ValueError) as e:
+				logging.error(f"Erro ao converter valor de entrada: {str(e)}")
+				self._state = AutoTuner.STATE_FAILED
+				return True
+
+			# Inicializa o tuner se necessário
+			if (self._state == AutoTuner.STATE_OFF
+					or self._state == AutoTuner.STATE_SUCCEEDED
+					or self._state == AutoTuner.STATE_FAILED):
+				try:
+					self._initTuner(inputValue, now)
+					logging.info(f"AutoTuner reinicializado - Estado: {self._state}, Input: {inputValue}")
+				except Exception as e:
+					logging.error(f"Erro ao inicializar tuner: {str(e)}")
+					self._state = AutoTuner.STATE_FAILED
+					return True
+
+			# Verifica se já passou tempo suficiente desde a última execução
+			if (now - self._lastRunTimestamp) < self._sampleTime:
+				logging.debug(f"Aguardando tempo de amostragem - Decorrido: {now - self._lastRunTimestamp}ms")
+				return False
+
+			self._lastRunTimestamp = now
+
+			# Log dos valores atuais
+			logging.info(f"Estado atual - Input: {inputValue}, Setpoint: {self._setpoint}, Noise Band: {self._noiseband}")
+			
+			# check input and change relay state if necessary
+			if (self._state == AutoTuner.STATE_RELAY_STEP_UP
+					and inputValue > self._setpoint + self._noiseband):
+				self._state = AutoTuner.STATE_RELAY_STEP_DOWN
+				logging.info(f"Mudando para STEP_DOWN - Input: {inputValue} > Setpoint+Noise: {self._setpoint + self._noiseband}")
+				self.log(f'Mudando estado para: {self._state}')
+				self.log(f'Input: {inputValue}')
+			elif (self._state == AutoTuner.STATE_RELAY_STEP_DOWN
+					and inputValue < self._setpoint - self._noiseband):
+				self._state = AutoTuner.STATE_RELAY_STEP_UP
+				logging.info(f"Mudando para STEP_UP - Input: {inputValue} < Setpoint-Noise: {self._setpoint - self._noiseband}")
+				self.log(f'Mudando estado para: {self._state}')
+				self.log(f'Input: {inputValue}')
+
+			# set output
+			old_output = self._output
+			if (self._state == AutoTuner.STATE_RELAY_STEP_UP):
+				self._output = self._initialOutput + self._outputstep
+			elif self._state == AutoTuner.STATE_RELAY_STEP_DOWN:
+				self._output = self._initialOutput - self._outputstep
+			else:
+				# Se o estado não é STEP_UP nem STEP_DOWN, mantém o output inicial
+				self._output = self._initialOutput
+
+			# respect output limits
+			self._output = min(self._output, self._outputMax)
+			self._output = max(self._output, self._outputMin)
+
+			if old_output != self._output:
+				logging.info(f"Saída atualizada: {self._output}% (anterior: {old_output}%)")
+
+			# identify peaks
+			isMax = True
+			isMin = True
+
+			for val in self._inputs:
+				isMax = isMax and (inputValue > val)
+				isMin = isMin and (inputValue < val)
+
+			self._inputs.append(inputValue)
+
+			# Log do estado do buffer de entradas
+			logging.debug(f"Buffer de entradas: {len(self._inputs)}/{self._inputs.maxlen}")
+
+			# we don't want to trust the maxes or mins until the input array is full
+			if len(self._inputs) < self._inputs.maxlen:
+				logging.info(f"Aguardando buffer encher: {len(self._inputs)}/{self._inputs.maxlen}")
+				return False
+
+			# increment peak count and record peak time for maxima and minima
+			inflection = False
+
+			# peak types:
+			# -1: minimum
+			# +1: maximum
+			if isMax:
+				if self._peakType == -1:
+					inflection = True
+				self._peakType = 1
+			elif isMin:
+				if self._peakType == 1:
+					inflection = True
+				self._peakType = -1
+
+			# update peak times and values
+			if inflection:
+				self._peakCount += 1
+				self._peaks.append(inputValue)
+				self._peakTimestamps.append(now)
+				logging.info(f"Pico encontrado: {inputValue} (total: {self._peakCount})")
+				self.log(f'Pico encontrado: {inputValue}')
+				self.log(f'Total de picos: {self._peakCount}')
+
+			# check for convergence of induced oscillation
+			# convergence of amplitude assessed on last 4 peaks (1.5 cycles)
+			self._inducedAmplitude = 0
+
+			if inflection and (self._peakCount > 4):
+				absMax = self._peaks[-2]
+				absMin = self._peaks[-2]
+				for i in range(0, len(self._peaks) - 2):
+					self._inducedAmplitude += abs(self._peaks[i] - self._peaks[i+1])
+					absMax = max(self._peaks[i], absMax)
+					absMin = min(self._peaks[i], absMin)
+
+				self._inducedAmplitude /= 6.0
+
+				# check convergence criterion for amplitude of induced oscillation
+				amplitudeDev = ((0.5 * (absMax - absMin) - self._inducedAmplitude)
+								/ self._inducedAmplitude)
+
+				logging.info(f"Amplitude: {self._inducedAmplitude}, Desvio: {amplitudeDev}")
+				self.log(f'Amplitude: {self._inducedAmplitude}')
+				self.log(f'Desvio de amplitude: {amplitudeDev}')
+
+				if amplitudeDev < AutoTuner.PEAK_AMPLITUDE_TOLERANCE:
+					self._state = AutoTuner.STATE_SUCCEEDED
+					logging.info("AutoTune convergiu com sucesso!")
+
+			# if the autotune has not already converged
+			# terminate after 10 cycles
+			if self._peakCount >= 20:
+				logging.error("AutoTune falhou - Número máximo de picos atingido sem convergência")
+				self._output = 0
+				self._state = AutoTuner.STATE_FAILED
+				return True
+
+			if self._state == AutoTuner.STATE_SUCCEEDED:
+				self._output = 0
+
+				# calculate ultimate gain
+				self._Ku = 4.0 * self._outputstep / (self._inducedAmplitude * math.pi)
+
+				# calculate ultimate period in seconds
+				period1 = self._peakTimestamps[3] - self._peakTimestamps[1]
+				period2 = self._peakTimestamps[4] - self._peakTimestamps[2]
+				self._Pu = 0.5 * (period1 + period2) / 1000.0
+				
+				logging.info(f"Parâmetros finais - Ku: {self._Ku}, Pu: {self._Pu}")
+				return True
+
 			return False
 
-		self._lastRunTimestamp = now
-
-		# Log dos valores atuais
-		logging.info(f"Estado atual - Input: {inputValue}, Setpoint: {self._setpoint}, Noise Band: {self._noiseband}")
-		
-		# check input and change relay state if necessary
-		if (self._state == AutoTuner.STATE_RELAY_STEP_UP
-				and inputValue > self._setpoint + self._noiseband):
-			self._state = AutoTuner.STATE_RELAY_STEP_DOWN
-			logging.info(f"Mudando para STEP_DOWN - Input: {inputValue} > Setpoint+Noise: {self._setpoint + self._noiseband}")
-			self.log(f'Mudando estado para: {self._state}')
-			self.log(f'Input: {inputValue}')
-		elif (self._state == AutoTuner.STATE_RELAY_STEP_DOWN
-				and inputValue < self._setpoint - self._noiseband):
-			self._state = AutoTuner.STATE_RELAY_STEP_UP
-			logging.info(f"Mudando para STEP_UP - Input: {inputValue} < Setpoint-Noise: {self._setpoint - self._noiseband}")
-			self.log(f'Mudando estado para: {self._state}')
-			self.log(f'Input: {inputValue}')
-
-		# set output
-		old_output = self._output
-		if (self._state == AutoTuner.STATE_RELAY_STEP_UP):
-			self._output = self._initialOutput + self._outputstep
-		elif self._state == AutoTuner.STATE_RELAY_STEP_DOWN:
-			self._output = self._initialOutput - self._outputstep
-
-		# respect output limits
-		self._output = min(self._output, self._outputMax)
-		self._output = max(self._output, self._outputMin)
-
-		if old_output != self._output:
-			logging.info(f"Saída atualizada: {self._output}% (anterior: {old_output}%)")
-
-		# identify peaks
-		isMax = True
-		isMin = True
-
-		for val in self._inputs:
-			isMax = isMax and (inputValue > val)
-			isMin = isMin and (inputValue < val)
-
-		self._inputs.append(inputValue)
-
-		# Log do estado do buffer de entradas
-		logging.debug(f"Buffer de entradas: {len(self._inputs)}/{self._inputs.maxlen}")
-
-		# we don't want to trust the maxes or mins until the input array is full
-		if len(self._inputs) < self._inputs.maxlen:
-			logging.info(f"Aguardando buffer encher: {len(self._inputs)}/{self._inputs.maxlen}")
-			return False
-
-		# increment peak count and record peak time for maxima and minima
-		inflection = False
-
-		# peak types:
-		# -1: minimum
-		# +1: maximum
-		if isMax:
-			if self._peakType == -1:
-				inflection = True
-			self._peakType = 1
-		elif isMin:
-			if self._peakType == 1:
-				inflection = True
-			self._peakType = -1
-
-		# update peak times and values
-		if inflection:
-			self._peakCount += 1
-			self._peaks.append(inputValue)
-			self._peakTimestamps.append(now)
-			logging.info(f"Pico encontrado: {inputValue} (total: {self._peakCount})")
-			self.log(f'Pico encontrado: {inputValue}')
-			self.log(f'Total de picos: {self._peakCount}')
-
-		# check for convergence of induced oscillation
-		# convergence of amplitude assessed on last 4 peaks (1.5 cycles)
-		self._inducedAmplitude = 0
-
-		if inflection and (self._peakCount > 4):
-			absMax = self._peaks[-2]
-			absMin = self._peaks[-2]
-			for i in range(0, len(self._peaks) - 2):
-				self._inducedAmplitude += abs(self._peaks[i] - self._peaks[i+1])
-				absMax = max(self._peaks[i], absMax)
-				absMin = min(self._peaks[i], absMin)
-
-			self._inducedAmplitude /= 6.0
-
-			# check convergence criterion for amplitude of induced oscillation
-			amplitudeDev = ((0.5 * (absMax - absMin) - self._inducedAmplitude)
-							/ self._inducedAmplitude)
-
-			logging.info(f"Amplitude: {self._inducedAmplitude}, Desvio: {amplitudeDev}")
-			self.log(f'Amplitude: {self._inducedAmplitude}')
-			self.log(f'Desvio de amplitude: {amplitudeDev}')
-
-			if amplitudeDev < AutoTuner.PEAK_AMPLITUDE_TOLERANCE:
-				self._state = AutoTuner.STATE_SUCCEEDED
-				logging.info("AutoTune convergiu com sucesso!")
-
-		# if the autotune has not already converged
-		# terminate after 10 cycles
-		if self._peakCount >= 20:
-			logging.error("AutoTune falhou - Número máximo de picos atingido sem convergência")
-			self._output = 0
+		except Exception as e:
+			logging.error(f"Erro no método run: {str(e)}")
 			self._state = AutoTuner.STATE_FAILED
 			return True
-
-		if self._state == AutoTuner.STATE_SUCCEEDED:
-			self._output = 0
-
-			# calculate ultimate gain
-			self._Ku = 4.0 * self._outputstep / (self._inducedAmplitude * math.pi)
-
-			# calculate ultimate period in seconds
-			period1 = self._peakTimestamps[3] - self._peakTimestamps[1]
-			period2 = self._peakTimestamps[4] - self._peakTimestamps[2]
-			self._Pu = 0.5 * (period1 + period2) / 1000.0
-			
-			logging.info(f"Parâmetros finais - Ku: {self._Ku}, Pu: {self._Pu}")
-			return True
-
-		return False
 
 	def _currentTimeMs(self):
 		return time.time() * 1000
@@ -631,20 +654,35 @@ class AutoTuner(object):
 	def _initTuner(self, inputValue, timestamp):
 		try:
 			logging.info(f"Iniciando AutoTuner - Input: {inputValue}, Timestamp: {timestamp}")
+			
+			# Reinicia todas as variáveis
 			self._peakType = 0
 			self._peakCount = 0
-			self._output = 0
-			self._initialOutput = 0
+			self._initialOutput = 50  # Começa com 50% de potência
+			self._output = self._initialOutput
 			self._Ku = 0
 			self._Pu = 0
+			
+			# Limpa os buffers
 			self._inputs.clear()
 			self._peaks.clear()
 			self._peakTimestamps.clear()
+			
+			# Adiciona o primeiro timestamp
 			self._peakTimestamps.append(timestamp)
+			
+			# Define o estado inicial
 			self._state = AutoTuner.STATE_RELAY_STEP_UP
-			logging.info("AutoTuner inicializado com sucesso")
+			
+			# Adiciona o primeiro valor de entrada
+			self._inputs.append(float(inputValue))
+			
+			logging.info(f"AutoTuner inicializado com sucesso - Estado: {self._state}, Output Inicial: {self._initialOutput}%")
+			return True
+			
 		except Exception as e:
 			logging.error(f"Erro ao inicializar AutoTuner: {str(e)}")
+			self._state = AutoTuner.STATE_FAILED
 			raise
 
 def setup(cbpi):
